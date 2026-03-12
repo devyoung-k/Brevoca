@@ -1,0 +1,1 @@
+"""Scriba Celery worker package."""
