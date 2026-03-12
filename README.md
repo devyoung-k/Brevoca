@@ -2,11 +2,13 @@
 
 # 🎙️ Scriba
 
-**AI 회의록 자동 생성 데스크톱 앱**
+**AI 회의록 자동 생성 서비스 워크스페이스**
 
-실시간 음성 녹음 → 자동 텍스트 변환 → AI 회의록 생성
+데스크톱 레퍼런스 앱 + 웹 서비스 전환 작업을 함께 관리합니다.
 
-모든 처리가 **로컬**에서 이루어집니다. 인터넷 없이, 개인정보 걱정 없이.
+현재 Electron 기반 로컬 앱은 `apps/desktop`에 있고, 웹 서비스 골격은 `apps/web`, `apps/api`, `workers/ai`에 있습니다.
+
+JavaScript 패키지는 pnpm workspace로 관리하고, Python 서비스는 각 디렉터리의 `pyproject.toml`로 독립 관리합니다.
 
 <br />
 
@@ -82,19 +84,37 @@ git clone https://github.com/ksyee/Scriba.git
 cd Scriba
 
 # 의존성 설치
-npm install --legacy-peer-deps
+pnpm install
 
-# 개발 모드 실행
-npm run dev
+# 웹 앱 개발 모드 실행
+pnpm dev
 ```
 
-> 💡 앱은 실행 시 `python/requirements-stt.txt`를 기준으로 Python STT 의존성 자동 설치를 먼저 시도합니다.  
+> 💡 데스크톱 앱은 실행 시 `apps/desktop/python/requirements-stt.txt`를 기준으로 Python STT 의존성 자동 설치를 먼저 시도합니다.  
 > 자동 설치가 실패하면 앱은 `whisper.cpp` 백엔드로 자동 폴백합니다.
 
 ### 프로덕션 빌드
 
 ```bash
-npm run build
+pnpm build
+```
+
+### 모노레포 운영
+
+```bash
+# 웹 앱 실행
+pnpm dev
+
+# FastAPI 실행
+pnpm dev:api
+
+# Celery worker 실행
+pnpm dev:worker
+
+# 또는 Makefile 사용
+make dev-web
+make dev-api
+make dev-worker
 ```
 
 ## 🎯 사용법
@@ -119,7 +139,7 @@ npm run build
 ## STT 백엔드
 
 - 기본 동작: `faster-whisper` 우선, 실패 시 `whisper.cpp` 폴백
-- 첫 실행: Python 의존성이 없으면 앱이 자동으로 `pip install -r python/requirements-stt.txt`를 시도
+- 첫 실행: Python 의존성이 없으면 앱이 자동으로 `pip install -r apps/desktop/python/requirements-stt.txt`를 시도
 - 강제 지정: `SCRIBA_STT_ENGINE=auto|faster-whisper|whisper.cpp`
 - Python 경로 지정: `SCRIBA_PYTHON_PATH=python`
 - faster-whisper 장치 지정: `SCRIBA_FASTER_WHISPER_DEVICE=cuda|cpu`
@@ -128,26 +148,23 @@ npm run build
 ## 📁 프로젝트 구조
 
 ```
-src/
-├── main/                      # Electron 메인 프로세스
-│   ├── index.ts               #   앱 진입점, IPC 핸들러
-│   └── services/
-│       ├── whisper.ts          #   Whisper STT 서비스
-│       └── ollama.ts           #   Ollama LLM 서비스
-├── preload/
-│   └── index.ts               # IPC 브릿지 (contextBridge)
-└── renderer/                  # React 렌더러
-    └── src/
-        ├── app/
-        │   ├── App.tsx         #   메인 앱 (오디오 캡처 + 상태 관리)
-        │   └── components/
-        │       ├── title-bar.tsx
-        │       ├── recording-control.tsx
-        │       ├── transcript-panel.tsx
-        │       ├── minutes-panel.tsx
-        │       └── status-bar.tsx
-        └── styles/             #   다크 테마 + TailwindCSS 4
+apps/
+├── desktop/                   # Electron 레퍼런스 앱
+├── web/                       # Next.js 웹 앱
+└── api/                       # FastAPI 백엔드
+workers/
+└── ai/                        # Celery worker
+packages/
+├── shared-types/              # 공통 타입/상태 정의
+└── prompts/                   # 프롬프트 자산
+infra/                         # 로컬 인프라 구성
 ```
+
+운영 원칙:
+
+- `apps/web`, `apps/desktop`, `packages/*`만 pnpm workspace에 포함
+- `apps/api`, `workers/ai`는 Python 프로젝트로 별도 관리
+- 공통 실행 진입점은 루트 `package.json`과 `Makefile`에서 제공
 
 ## 🔧 트러블슈팅
 
