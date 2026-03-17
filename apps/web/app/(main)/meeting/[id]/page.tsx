@@ -6,7 +6,6 @@ import Link from "next/link";
 import {
   AlertCircle,
   ArrowLeft,
-  CheckCircle,
   Clock,
   Download,
   FileAudio,
@@ -18,11 +17,13 @@ import { toast } from "sonner";
 import type { MeetingDetail, TranscriptSegment } from "@brevoca/contracts";
 import { authedFetch } from "@/lib/client/authed-fetch";
 import { TagEditor } from "@/components/TagEditor";
+import { ExportDocxDialog } from "@/components/ExportDocxDialog";
 
 export default function MeetingDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const [meeting, setMeeting] = useState<MeetingDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -85,18 +86,6 @@ export default function MeetingDetailPage({ params }: { params: Promise<{ id: st
     toast.success("공유 링크를 클립보드에 복사했습니다.");
   };
 
-  const handleExport = () => {
-    const markdown = meeting.summary?.markdown ?? meeting.transcriptText ?? "";
-    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${meeting.title}.md`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    toast.success("Markdown 내보내기를 시작했습니다.");
-  };
-
   return (
     <div className="min-h-full">
       <div className="border-b border-[var(--line-soft)] bg-[var(--bg-surface)]/50 backdrop-blur-sm">
@@ -139,7 +128,7 @@ export default function MeetingDetailPage({ params }: { params: Promise<{ id: st
                 <span className="hidden sm:inline">공유</span>
               </button>
               <button
-                onClick={handleExport}
+                onClick={() => setExportDialogOpen(true)}
                 className="flex items-center gap-2 px-4 py-2 rounded-[var(--radius-md)] bg-gradient-to-r from-[var(--mint-500)] to-[var(--sky-500)] text-[var(--graphite-950)] hover:opacity-90 transition-opacity"
               >
                 <Download className="w-4 h-4" />
@@ -174,28 +163,22 @@ export default function MeetingDetailPage({ params }: { params: Promise<{ id: st
         </section>
 
         <aside className="space-y-6">
-          <SummaryCard title="회의 개요">
-            <p className="text-[var(--text-secondary)] leading-relaxed">
-              {meeting.summary?.overview ?? "해당 없음"}
-            </p>
-          </SummaryCard>
-
-          <SummaryCard title="결정사항">
-            <BulletList items={meeting.summary?.decisions ?? []} icon="success" />
-          </SummaryCard>
-
-          <SummaryCard title="액션아이템">
-            {meeting.summary?.actionItems?.length ? (
+          <SummaryCard title="주요 결정 사항 및 다음 단계">
+            {meeting.summary?.nextSteps?.length ? (
               <div className="space-y-3">
-                {meeting.summary.actionItems.map((item, index) => (
+                {meeting.summary.nextSteps.map((item, index) => (
                   <div
                     key={`${item.content}-${index}`}
                     className="p-4 rounded-[var(--radius-md)] bg-[var(--graphite-800)] border border-[var(--line-soft)]"
                   >
                     <div className="font-medium mb-2">{item.content}</div>
-                    <div className="text-sm text-[var(--text-secondary)]">
-                      담당: {item.assignee ?? "미정"} / 기한: {item.dueDate ?? "미정"}
-                    </div>
+                    {(item.assignee || item.dueDate) && (
+                      <div className="text-sm text-[var(--text-secondary)]">
+                        {item.assignee && `담당: ${item.assignee}`}
+                        {item.assignee && item.dueDate && " / "}
+                        {item.dueDate && `기한: ${item.dueDate}`}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -204,15 +187,26 @@ export default function MeetingDetailPage({ params }: { params: Promise<{ id: st
             )}
           </SummaryCard>
 
-          <SummaryCard title="미결정 사항">
-            <BulletList items={meeting.summary?.openQuestions ?? []} icon="warning" />
-          </SummaryCard>
-
-          <SummaryCard title="리스크">
-            <BulletList items={meeting.summary?.risks ?? []} icon="warning" />
-          </SummaryCard>
+          {meeting.summary?.topics?.map((topic, index) => (
+            <SummaryCard key={`${topic.title}-${index}`} title={topic.title}>
+              <div className="space-y-2">
+                {topic.points.map((point, pointIndex) => (
+                  <div key={`${point}-${pointIndex}`} className="flex items-start gap-3">
+                    <span className="text-[var(--text-secondary)] mt-0.5 flex-shrink-0">•</span>
+                    <p className="text-[var(--text-secondary)] leading-relaxed">{point}</p>
+                  </div>
+                ))}
+              </div>
+            </SummaryCard>
+          ))}
         </aside>
       </div>
+
+      <ExportDocxDialog
+        meeting={meeting}
+        open={exportDialogOpen}
+        onOpenChange={setExportDialogOpen}
+      />
     </div>
   );
 }
@@ -287,33 +281,6 @@ function SummaryCard({
     <div className="p-6 rounded-[var(--radius-xl)] bg-[var(--bg-surface)] border border-[var(--line-soft)]">
       <h2 className="text-xl mb-4">{title}</h2>
       {children}
-    </div>
-  );
-}
-
-function BulletList({
-  items,
-  icon,
-}: {
-  items: string[];
-  icon: "success" | "warning";
-}) {
-  if (items.length === 0) {
-    return <p className="text-[var(--text-secondary)]">해당 없음</p>;
-  }
-
-  return (
-    <div className="space-y-3">
-      {items.map((item, index) => (
-        <div key={`${item}-${index}`} className="flex items-start gap-3">
-          {icon === "success" ? (
-            <CheckCircle className="w-5 h-5 text-[var(--mint-500)] flex-shrink-0 mt-0.5" />
-          ) : (
-            <AlertCircle className="w-5 h-5 text-[var(--signal-orange-500)] flex-shrink-0 mt-0.5" />
-          )}
-          <p className="text-[var(--text-secondary)]">{item}</p>
-        </div>
-      ))}
     </div>
   );
 }

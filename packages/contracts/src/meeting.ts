@@ -18,13 +18,15 @@ export interface ActionItem {
   dueDate: string | null;
 }
 
+export interface DiscussionTopic {
+  title: string;
+  points: string[];
+}
+
 export interface MeetingSummary {
   markdown: string;
-  overview: string;
-  decisions: string[];
-  actionItems: ActionItem[];
-  openQuestions: string[];
-  risks: string[];
+  nextSteps: ActionItem[];
+  topics: DiscussionTopic[];
 }
 
 export interface TranscriptSegment {

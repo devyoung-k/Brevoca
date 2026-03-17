@@ -19,13 +19,15 @@ const require = createRequire(import.meta.url);
 
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 const WHISPER_MAX_SIZE = 24 * 1024 * 1024; // 24MB (25MB 제한에 여유분)
+const TRANSCRIBE_MAX_DURATION_SEC = 1400; // gpt-4o-transcribe-diarize 모델 최대 길이 제한
 const DEFAULT_CHUNK_DURATION_SEC = 900; // 15분 단위 분할
+const PREPROCESS_BITRATE = "48k"; // 음성 전사에 충분한 비트레이트
 const DEFAULT_TRANSCRIBE_CONCURRENCY = 4;
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe-diarize";
 const DEFAULT_SUMMARY_MODEL = "gpt-5-mini";
 
 const SUMMARY_JSON_SHAPE =
-  '{"overview":string,"decisions":string[],"actionItems":[{"content":string,"assignee":string|null,"dueDate":string|null}],"openQuestions":string[],"risks":string[]}';
+  '{"nextSteps":[{"content":string,"assignee":string|null,"dueDate":string|null}],"topics":[{"title":string,"points":[string]}]}';
 
 function getRequiredEnv(name: string, fallback?: string): string {
   const value = process.env[name]?.trim() || fallback;
@@ -60,11 +62,57 @@ export async function transcribeAudioFile(options: {
   language: string;
   signal?: AbortSignal;
 }): Promise<TranscriptionResult> {
-  if (options.fileBuffer.length <= WHISPER_MAX_SIZE) {
-    return transcribeSingleFile(options.fileBuffer, options.fileName, options.language, options.signal);
+  const { buffer, fileName } = await preprocessAudio(
+    options.fileBuffer,
+    options.fileName,
+    options.signal,
+  );
+
+  const needsChunking =
+    buffer.length > WHISPER_MAX_SIZE ||
+    (await getAudioDurationSec(buffer, fileName, options.signal)) > TRANSCRIBE_MAX_DURATION_SEC;
+
+  if (!needsChunking) {
+    return transcribeSingleFile(buffer, fileName, options.language, options.signal);
   }
 
-  return transcribeChunked(options.fileBuffer, options.fileName, options.language, options.signal);
+  return transcribeChunked(buffer, fileName, options.language, options.signal);
+}
+
+async function preprocessAudio(
+  fileBuffer: Buffer,
+  fileName: string,
+  signal?: AbortSignal,
+): Promise<{ buffer: Buffer; fileName: string }> {
+  const ffmpegPath = await getFFmpegPath();
+  const workDir = await fs.mkdtemp(path.join(tmpdir(), "brevoca-preprocess-"));
+
+  try {
+    const ext = path.extname(fileName) || ".webm";
+    const inputPath = path.join(workDir, `input${ext}`);
+    const outputPath = path.join(workDir, "preprocessed.ogg");
+    await fs.writeFile(inputPath, fileBuffer);
+
+    await execFileAsync(
+      ffmpegPath,
+      [
+        "-i", inputPath,
+        "-af", "silenceremove=start_periods=1:start_threshold=-35dB:stop_periods=-1:stop_duration=0.5:stop_threshold=-35dB",
+        "-ac", "1",
+        "-c:a", "libopus",
+        "-b:a", PREPROCESS_BITRATE,
+        "-vn",
+        "-y",
+        outputPath,
+      ],
+      signal ? { signal } : undefined,
+    );
+
+    const buffer = await fs.readFile(outputPath);
+    return { buffer, fileName: "preprocessed.ogg" };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function transcribeSingleFile(
@@ -125,9 +173,9 @@ async function transcribeChunked(
     await fs.writeFile(inputPath, fileBuffer);
 
     const chunkDurationSec = getChunkDurationSec();
-    const chunkPaths = await splitAudio(inputPath, workDir, ext, chunkDurationSec, signal);
+    const { paths: chunkPaths, offsets: chunkOffsets } = await splitAudio(inputPath, workDir, ext, chunkDurationSec, signal);
 
-    const transcripts = await transcribeChunksInParallel(chunkPaths, language, chunkDurationSec, signal);
+    const transcripts = await transcribeChunksInParallel(chunkPaths, language, chunkOffsets, signal);
 
     return mergeTranscriptionResults(transcripts);
   } finally {
@@ -138,7 +186,7 @@ async function transcribeChunked(
 async function transcribeChunksInParallel(
   chunkPaths: string[],
   language: string,
-  chunkDurationSec: number,
+  chunkOffsets: number[],
   signal?: AbortSignal,
 ): Promise<TranscriptionResult[]> {
   const transcripts = new Array<TranscriptionResult>(chunkPaths.length);
@@ -160,7 +208,7 @@ async function transcribeChunksInParallel(
         const chunkBuffer = await fs.readFile(chunkPath);
         const chunkName = path.basename(chunkPath);
         const chunkResult = await transcribeSingleFile(chunkBuffer, chunkName, language, signal);
-        const chunkOffsetSec = currentIndex * chunkDurationSec;
+        const chunkOffsetSec = chunkOffsets[currentIndex] ?? 0;
         transcripts[currentIndex] = {
           transcriptText: chunkResult.transcriptText,
           transcriptSegments: offsetTranscriptSegments(chunkResult.transcriptSegments, chunkOffsetSec),
@@ -346,28 +394,149 @@ function resolveFfmpegFromNodeModules(): string | null {
   }
 }
 
+async function getAudioDurationSec(
+  fileBuffer: Buffer,
+  fileName: string,
+  signal?: AbortSignal,
+): Promise<number> {
+  const workDir = await fs.mkdtemp(path.join(tmpdir(), "brevoca-duration-"));
+
+  try {
+    const ext = path.extname(fileName) || ".ogg";
+    const inputPath = path.join(workDir, `input${ext}`);
+    await fs.writeFile(inputPath, fileBuffer);
+    return await getAudioDurationSecFromPath(inputPath, signal);
+  } catch {
+    return TRANSCRIBE_MAX_DURATION_SEC + 1;
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function getAudioDurationSecFromPath(
+  inputPath: string,
+  signal?: AbortSignal,
+): Promise<number> {
+  const ffmpegPath = await getFFmpegPath();
+
+  // ffprobe 없이 ffmpeg -i 의 stderr 출력에서 Duration 파싱
+  try {
+    await execFileAsync(
+      ffmpegPath,
+      ["-i", inputPath, "-hide_banner", "-f", "null", "-"],
+      signal ? { signal } : undefined,
+    );
+  } catch (err: unknown) {
+    // ffmpeg -i 는 출력 없이 실행하면 에러로 끝나지만 stderr에 Duration 정보 포함
+    const stderr = String((err as { stderr?: unknown })?.stderr ?? "");
+    const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (match) {
+      const hours = parseInt(match[1], 10);
+      const minutes = parseInt(match[2], 10);
+      const seconds = parseFloat(match[3]);
+      return hours * 3600 + minutes * 60 + seconds;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * 오디오에서 무음 구간을 감지하고, 목표 분할 지점(chunkDurationSec 배수) 근처의
+ * 무음 구간 중앙점을 찾아 최적의 분할 시점 목록을 반환한다.
+ */
+async function findSilenceSplitPoints(
+  inputPath: string,
+  totalDurationSec: number,
+  chunkDurationSec: number,
+  signal?: AbortSignal,
+): Promise<number[]> {
+  const numChunks = Math.ceil(totalDurationSec / chunkDurationSec);
+  if (numChunks <= 1) return [];
+
+  const ffmpegPath = await getFFmpegPath();
+
+  try {
+    const { stderr } = await execFileAsync(
+      ffmpegPath,
+      [
+        "-i", inputPath,
+        "-af", "silencedetect=noise=-35dB:d=0.3",
+        "-f", "null",
+        "-",
+      ],
+      signal ? { signal } : undefined,
+    );
+
+    // stderr에서 silence_end, silence_duration 파싱
+    const silences: Array<{ mid: number }> = [];
+    const regex = /silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/g;
+    let match;
+    while ((match = regex.exec(String(stderr))) !== null) {
+      const end = parseFloat(match[1]);
+      const dur = parseFloat(match[2]);
+      silences.push({ mid: end - dur / 2 });
+    }
+
+    if (silences.length === 0) return [];
+
+    // 각 목표 분할 지점에서 ±15% 범위 내 가장 가까운 무음 중앙점 선택
+    const searchRadius = chunkDurationSec * 0.15;
+    const splitPoints: number[] = [];
+
+    for (let i = 1; i < numChunks; i++) {
+      const target = i * chunkDurationSec;
+      let bestPoint = -1;
+      let bestDistance = Infinity;
+
+      for (const silence of silences) {
+        const distance = Math.abs(silence.mid - target);
+        if (distance <= searchRadius && distance < bestDistance) {
+          bestPoint = silence.mid;
+          bestDistance = distance;
+        }
+      }
+
+      splitPoints.push(bestPoint >= 0 ? bestPoint : target);
+    }
+
+    return splitPoints;
+  } catch {
+    // silencedetect 실패 시 빈 배열 반환 → 고정 간격 분할 fallback
+    return [];
+  }
+}
+
 async function splitAudio(
   inputPath: string,
   workDir: string,
   _ext: string,
   chunkDurationSec: number,
   signal?: AbortSignal,
-): Promise<string[]> {
+): Promise<{ paths: string[]; offsets: number[] }> {
   const ffmpegPath = await getFFmpegPath();
 
   // 항상 opus/ogg로 재인코딩하여 크기를 예측 가능하게 만듦
-  // opus 96kbps ≈ 10분 → ~7.2MB (24MB 제한 안전)
+  // opus 48kbps ≈ 15분 → ~5.4MB (24MB 제한 안전)
   const outExt = ".ogg";
   const outputPattern = path.join(workDir, `chunk_%03d${outExt}`);
+
+  // 무음 구간 기반 분할 시점 탐색 → 발화 도중 잘림 방지
+  const totalDurationSec = await getAudioDurationSecFromPath(inputPath, signal);
+  const silenceSplitPoints = await findSilenceSplitPoints(inputPath, totalDurationSec, chunkDurationSec, signal);
+
+  const segmentArgs = silenceSplitPoints.length > 0
+    ? ["-segment_times", silenceSplitPoints.map((t) => t.toFixed(3)).join(",")]
+    : ["-segment_time", String(chunkDurationSec)];
 
   await execFileAsync(
     ffmpegPath,
     [
       "-i", inputPath,
       "-f", "segment",
-      "-segment_time", String(chunkDurationSec),
+      ...segmentArgs,
       "-c:a", "libopus",
-      "-b:a", "96k",
+      "-b:a", PREPROCESS_BITRATE,
       "-vn",
       "-reset_timestamps", "1",
       "-y",
@@ -397,7 +566,13 @@ async function splitAudio(
     }
   }
 
-  return chunkPaths;
+  // 각 청크의 시작 오프셋: [0, splitPoint1, splitPoint2, ...]
+  const offsets = [0, ...silenceSplitPoints.length > 0
+    ? silenceSplitPoints
+    : Array.from({ length: chunkPaths.length - 1 }, (_, i) => (i + 1) * chunkDurationSec),
+  ];
+
+  return { paths: chunkPaths, offsets };
 }
 
 export async function summarizeTranscript(options: {
@@ -494,19 +669,18 @@ async function mergeChunkSummaries(
   signal?: AbortSignal,
 ): Promise<Omit<MeetingSummary, "markdown">> {
   const chunkSummaryText = chunkSummaries
-    .map((summary, index) =>
-      [
-        `Chunk ${index + 1}`,
-        `Overview: ${summary.overview || "해당 없음"}`,
-        `Decisions: ${summary.decisions.join(" | ") || "해당 없음"}`,
-        `ActionItems: ${
-          summary.actionItems.map((item) => `${item.content} / 담당: ${item.assignee ?? "미정"} / 기한: ${item.dueDate ?? "미정"}`).join(" | ") ||
-          "해당 없음"
-        }`,
-        `OpenQuestions: ${summary.openQuestions.join(" | ") || "해당 없음"}`,
-        `Risks: ${summary.risks.join(" | ") || "해당 없음"}`,
-      ].join("\n"),
-    )
+    .map((summary, index) => {
+      const lines = [`Chunk ${index + 1}`];
+      if (summary.nextSteps.length > 0) {
+        lines.push(
+          `NextSteps: ${summary.nextSteps.map((item) => `${item.content} / 담당: ${item.assignee ?? "미정"} / 기한: ${item.dueDate ?? "미정"}`).join(" | ")}`,
+        );
+      }
+      for (const topic of summary.topics) {
+        lines.push(`Topic [${topic.title}]: ${topic.points.join(" | ")}`);
+      }
+      return lines.join("\n");
+    })
     .join("\n\n");
 
   const text = await requestSummaryText(
@@ -515,8 +689,10 @@ async function mergeChunkSummaries(
       `Use this JSON shape: ${SUMMARY_JSON_SHAPE}.`,
       "Do not wrap the JSON in markdown fences.",
       "You are merging structured chunk summaries from one meeting transcript.",
-      "Preserve only information that is supported by one or more chunk summaries.",
-      "Deduplicate repeated points, keep only concrete decisions and action items, and leave unclear details as null or omit them.",
+      "Merge topics with similar titles into a single topic, combining all their points.",
+      "Preserve all unique points from each chunk — do not drop any information.",
+      "Deduplicate only truly identical points.",
+      "Keep nextSteps concrete and actionable. Leave unclear assignee or dueDate as null.",
       "",
       "Meeting title:",
       title,
@@ -572,7 +748,9 @@ function buildTranscriptSummaryPrompt(
     "Return strict JSON only.",
     `Use this JSON shape: ${SUMMARY_JSON_SHAPE}.`,
     "Do not wrap the JSON in markdown fences.",
-    "The transcript may contain ASR noise or duplicated fragments. Focus on stable agenda, decisions, follow-ups, unresolved questions, and risks.",
+    "The transcript may contain ASR noise or duplicated fragments.",
+    "Identify all distinct topics discussed and capture every opinion, decision, observation, and background context under the appropriate topic.",
+    "Do not drop any discussion point — comprehensiveness is more important than brevity.",
     "Do not invent facts that are not supported by the transcript.",
     "",
     "Meeting title:",
@@ -602,8 +780,10 @@ function buildChunkSummaryPrompt(
     `Use this JSON shape: ${SUMMARY_JSON_SHAPE}.`,
     "Do not wrap the JSON in markdown fences.",
     "You are summarizing one chunk of a longer meeting transcript.",
-    "The transcript may contain ASR noise, filler, and repeated phrases. Extract only stable information that would help create the final meeting minutes.",
-    "If a field is not supported in this chunk, leave it empty.",
+    "The transcript may contain ASR noise, filler, and repeated phrases.",
+    "Identify topics discussed in this chunk and capture all opinions, observations, and context.",
+    "Do not drop any discussion point — comprehensiveness is more important than brevity.",
+    "If a field is not applicable in this chunk, leave it as an empty array.",
     "",
     "Meeting title:",
     title,
@@ -659,11 +839,8 @@ function parseSummaryJson(raw: string): Omit<MeetingSummary, "markdown"> {
   const parsed = JSON.parse(normalized) as Partial<Omit<MeetingSummary, "markdown">>;
 
   return {
-    overview: parsed.overview?.trim() || "해당 없음",
-    decisions: normalizeStringArray(parsed.decisions),
-    actionItems: normalizeActionItems(parsed.actionItems),
-    openQuestions: normalizeStringArray(parsed.openQuestions),
-    risks: normalizeStringArray(parsed.risks),
+    nextSteps: normalizeActionItems(parsed.nextSteps),
+    topics: normalizeTopics(parsed.topics),
   };
 }
 
@@ -677,7 +854,33 @@ function normalizeStringArray(value: unknown): string[] {
     .filter(Boolean);
 }
 
-function normalizeActionItems(value: unknown): MeetingSummary["actionItems"] {
+function normalizeTopics(value: unknown): MeetingSummary["topics"] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+
+      const title = typeof entry.title === "string" ? entry.title.trim() : "";
+      if (!title) {
+        return null;
+      }
+
+      const points = normalizeStringArray(entry.points);
+      if (points.length === 0) {
+        return null;
+      }
+
+      return { title, points };
+    })
+    .filter((entry): entry is MeetingSummary["topics"][number] => Boolean(entry));
+}
+
+function normalizeActionItems(value: unknown): MeetingSummary["nextSteps"] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -699,40 +902,30 @@ function normalizeActionItems(value: unknown): MeetingSummary["actionItems"] {
         dueDate: typeof entry.dueDate === "string" && entry.dueDate.trim() ? entry.dueDate.trim() : null,
       };
     })
-    .filter((entry): entry is MeetingSummary["actionItems"][number] => Boolean(entry));
+    .filter((entry): entry is MeetingSummary["nextSteps"][number] => Boolean(entry));
 }
 
 function buildMarkdown(summary: Omit<MeetingSummary, "markdown">): string {
-  const sections = [
-    `## 회의 개요\n- ${summary.overview || "해당 없음"}`,
-    `## 결정사항\n${toBullets(summary.decisions)}`,
-    `## 액션아이템\n${toActionBullets(summary.actionItems)}`,
-    `## 논의되었으나 미결정 사항\n${toBullets(summary.openQuestions)}`,
-    `## 주요 이슈 및 리스크\n${toBullets(summary.risks)}`,
-  ];
+  const sections: string[] = [];
+
+  if (summary.nextSteps.length > 0) {
+    const items = summary.nextSteps
+      .map((item) => {
+        let line = `- [ ] ${item.content}`;
+        if (item.assignee) line += ` / 담당: ${item.assignee}`;
+        if (item.dueDate) line += ` / 기한: ${item.dueDate}`;
+        return line;
+      })
+      .join("\n");
+    sections.push(`### 주요 결정 사항 및 다음 단계\n\n${items}`);
+  }
+
+  for (const topic of summary.topics) {
+    const points = topic.points.map((p) => `- ${p}`).join("\n");
+    sections.push(`### ${topic.title}\n\n${points}`);
+  }
 
   return sections.join("\n\n");
-}
-
-function toBullets(values: string[]): string {
-  if (values.length === 0) {
-    return "- 해당 없음";
-  }
-  return values.map((value) => `- ${value}`).join("\n");
-}
-
-function toActionBullets(values: MeetingSummary["actionItems"]): string {
-  if (values.length === 0) {
-    return "- 해당 없음";
-  }
-
-  return values
-    .map((item) => {
-      const assignee = item.assignee ?? "미정";
-      const dueDate = item.dueDate ?? "미정";
-      return `- ${item.content} / 담당: ${assignee} / 기한: ${dueDate}`;
-    })
-    .join("\n");
 }
 
 function getMimeType(fileName: string): string {

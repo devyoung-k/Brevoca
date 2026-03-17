@@ -157,7 +157,16 @@ function classifyError(message: string, stage: "transcribe" | "summarize"): Proc
     return "network_error";
   }
 
-  if (lower.includes("api key") || lower.includes("unauthorized") || lower.includes("quota")) {
+  if (
+    lower.includes("api key") ||
+    lower.includes("unauthorized") ||
+    lower.includes("quota") ||
+    lower.includes("the server had an error processing your request") ||
+    lower.includes("help.openai.com") ||
+    lower.includes("please include the request id") ||
+    lower.includes("request id") ||
+    lower.includes("server had an error")
+  ) {
     return "provider_error";
   }
 
