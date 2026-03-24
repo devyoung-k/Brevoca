@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import Link from "next/link";
 import { ChevronDown, Check, Plus } from "lucide-react";
 import { useAppSession } from "@/components/AppSessionProvider";
 import { toast } from "sonner";
@@ -127,6 +128,18 @@ export function WorkspaceSwitcher() {
             </div>
 
             <div className="px-2 pb-2 pt-1 border-t border-[var(--line-soft)] mx-2">
+              <Link
+                href="/settings"
+                onClick={() => {
+                  setIsOpen(false);
+                  setIsCreating(false);
+                  setNewName("");
+                }}
+                className="mt-1 flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-3 py-2.5 text-sm text-[var(--text-secondary)] transition-colors hover:bg-[var(--graphite-800)] hover:text-[var(--text-primary)]"
+              >
+                워크스페이스 관리 열기
+              </Link>
+
               {isCreating ? (
                 <div className="pt-2 space-y-2">
                   <input

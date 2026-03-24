@@ -11,10 +11,8 @@ import { toast } from "sonner";
 export default function Login() {
   const router = useRouter();
   const { status, workspaces, refresh } = useAppSession();
-  const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [companyName, setCompanyName] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -31,32 +29,9 @@ export default function Login() {
     setSubmitting(true);
 
     try {
-      if (isLogin) {
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        });
-
-        if (error) {
-          throw error;
-        }
-
-        if (!data.session) {
-          throw new Error("로그인 세션을 만들지 못했습니다.");
-        }
-
-        await refresh();
-        return;
-      }
-
-      const { data, error } = await supabase.auth.signUp({
+      const { data, error } = await supabase.auth.signInWithPassword({
         email: email.trim(),
         password,
-        options: {
-          data: {
-            company_name: companyName.trim(),
-          },
-        },
       });
 
       if (error) {
@@ -64,15 +39,18 @@ export default function Login() {
       }
 
       if (!data.session) {
-        toast.success("이메일 확인 후 로그인해주세요.");
-        setIsLogin(true);
-        return;
+        throw new Error("로그인 세션을 만들지 못했습니다.");
       }
 
       await refresh();
-      router.replace(`/onboarding?workspaceName=${encodeURIComponent(companyName.trim() || "새 워크스페이스")}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "로그인에 실패했습니다.";
+      const message =
+        error instanceof Error ? error.message : "로그인에 실패했습니다.";
+      if (message.toLowerCase().includes("invalid login credentials")) {
+        toast.error("이메일 또는 비밀번호가 올바르지 않습니다.");
+        return;
+      }
+
       toast.error(message);
     } finally {
       setSubmitting(false);
@@ -114,48 +92,15 @@ export default function Login() {
 
         {/* Card */}
         <div className="p-8 rounded-[var(--radius-xl)] bg-[var(--bg-surface)] border border-[var(--line-soft)] shadow-2xl">
-          {/* Tabs */}
-          <div className="flex gap-1 mb-8 p-1 bg-[var(--graphite-800)] rounded-lg">
-            <button
-              onClick={() => setIsLogin(true)}
-              className={`flex-1 py-2 rounded-md transition-all ${
-                isLogin
-                  ? "bg-gradient-to-r from-[var(--mint-500)] to-[var(--sky-500)] text-[var(--graphite-950)]"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-              }`}
-            >
-              로그인
-            </button>
-            <button
-              onClick={() => setIsLogin(false)}
-              className={`flex-1 py-2 rounded-md transition-all ${
-                !isLogin
-                  ? "bg-gradient-to-r from-[var(--mint-500)] to-[var(--sky-500)] text-[var(--graphite-950)]"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-              }`}
-            >
-              회원가입
-            </button>
+          <div className="mb-8 rounded-lg border border-[var(--line-soft)] bg-[var(--graphite-900)] p-4">
+            <div className="mb-1 font-medium">로그인 전용</div>
+            <p className="text-sm text-[var(--text-secondary)]">
+              새 계정은 관리자만 생성할 수 있습니다. 계정이 필요하면 관리자에게
+              요청해주세요.
+            </p>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {!isLogin && (
-              <div>
-                <label className="block text-sm mb-2">회사/팀명</label>
-                <input
-                  type="text"
-                  value={companyName}
-                  onChange={(e) => setCompanyName(e.target.value)}
-                  placeholder="예: ABC 제조"
-                  className="w-full px-4 py-3 rounded-[var(--radius-md)] bg-[var(--graphite-800)] border border-[var(--line-soft)] focus:border-[var(--mint-500)] focus:outline-none transition-colors"
-                  required={!isLogin}
-                />
-                <p className="text-xs text-[var(--text-secondary)] mt-1.5">
-                  첫 워크스페이스로 생성됩니다
-                </p>
-              </div>
-            )}
-
             <div>
               <label className="block text-sm mb-2">이메일</label>
               <div className="relative">
@@ -186,48 +131,35 @@ export default function Login() {
               </div>
             </div>
 
-            {isLogin && (
-              <div className="flex items-center justify-between text-sm">
-                <label className="flex items-center gap-2 text-[var(--text-secondary)]">
-                  <input
-                    type="checkbox"
-                    className="w-4 h-4 rounded border-[var(--line-soft)] bg-[var(--graphite-800)] checked:bg-[var(--mint-500)]"
-                  />
-                  로그인 유지
-                </label>
-                <button type="button" className="text-[var(--mint-500)] hover:underline">
-                  비밀번호 찾기
-                </button>
-              </div>
-            )}
+            <div className="flex items-center justify-between text-sm">
+              <label className="flex items-center gap-2 text-[var(--text-secondary)]">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 rounded border-[var(--line-soft)] bg-[var(--graphite-800)] checked:bg-[var(--mint-500)]"
+                />
+                로그인 유지
+              </label>
+              <button
+                type="button"
+                className="text-[var(--mint-500)] hover:underline"
+              >
+                비밀번호 찾기
+              </button>
+            </div>
 
             <button
               type="submit"
               disabled={submitting}
               className="w-full py-3 rounded-[var(--radius-md)] bg-gradient-to-r from-[var(--mint-500)] to-[var(--sky-500)] text-[var(--graphite-950)] hover:opacity-90 transition-opacity flex items-center justify-center gap-2 font-medium"
             >
-              <span>{submitting ? "처리 중..." : isLogin ? "로그인" : "시작하기"}</span>
+              <span>{submitting ? "처리 중..." : "로그인"}</span>
               <ArrowRight className="w-4 h-4" />
             </button>
           </form>
 
           {/* Footer */}
           <div className="mt-6 pt-6 border-t border-[var(--line-soft)] text-center text-sm text-[var(--text-secondary)]">
-            {isLogin ? (
-              <p>
-                계정이 없으신가요?{" "}
-                <button onClick={() => setIsLogin(false)} className="text-[var(--mint-500)] hover:underline">
-                  회원가입
-                </button>
-              </p>
-            ) : (
-              <p>
-                이미 계정이 있으신가요?{" "}
-                <button onClick={() => setIsLogin(true)} className="text-[var(--mint-500)] hover:underline">
-                  로그인
-                </button>
-              </p>
-            )}
+            <p>계정 생성은 관리자 전용입니다.</p>
           </div>
         </div>
 

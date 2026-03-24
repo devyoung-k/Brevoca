@@ -354,13 +354,36 @@ function buildAttendeeRows(attendees: Attendee[]): TableRow[] {
 
 function buildContentParagraphs(meeting: MeetingDetail): Paragraph[] {
   const paragraphs: Paragraph[] = [];
+  const summary = meeting.summary;
+  const reviewNotesSectionNumber = summary?.nextSteps?.length ? 5 : 4;
 
-  if (meeting.summary?.topics?.length) {
-    for (const topic of meeting.summary.topics) {
+  paragraphs.push(
+    new Paragraph({
+      spacing: { before: 200, after: 100 },
+      children: [text("1. 회의 목적", { bold: true, size: 22 })],
+    }),
+  );
+  paragraphs.push(
+    new Paragraph({
+      indent: { left: 240 },
+      spacing: { after: 120 },
+      children: [text(summary?.objective ?? "")],
+    }),
+  );
+
+  paragraphs.push(
+    new Paragraph({
+      spacing: { before: 200, after: 100 },
+      children: [text("2. 주요 논의 사항", { bold: true, size: 22 })],
+    }),
+  );
+
+  if (summary?.topics?.length) {
+    for (const [index, topic] of summary.topics.entries()) {
       paragraphs.push(
         new Paragraph({
           spacing: { before: 200, after: 100 },
-          children: [text(topic.title, { bold: true, size: 22 })],
+          children: [text(`2-${index + 1}. ${topic.title}`, { bold: true, size: 22 })],
         }),
       );
 
@@ -374,17 +397,57 @@ function buildContentParagraphs(meeting: MeetingDetail): Paragraph[] {
         );
       }
     }
+  } else {
+    paragraphs.push(
+      new Paragraph({
+        indent: { left: 240 },
+        spacing: { after: 60 },
+        children: [text("● 주요 논의 사항이 없습니다.")],
+      }),
+    );
   }
 
-  if (meeting.summary?.nextSteps?.length) {
+  paragraphs.push(
+    new Paragraph({
+      spacing: { before: 300, after: 100 },
+      children: [text("3. 회의 결론", { bold: true, size: 22 })],
+    }),
+  );
+
+  if (summary?.conclusions?.length) {
+    for (const [index, conclusion] of summary.conclusions.entries()) {
+      paragraphs.push(
+        new Paragraph({
+          indent: { left: 240 },
+          spacing: { after: 60 },
+          children: [text(`${index + 1}. ${conclusion}`)],
+        }),
+      );
+    }
+  } else if (summary?.nextSteps?.length) {
+    for (const [index, step] of summary.nextSteps.entries()) {
+      const parts: string[] = [step.content];
+      if (step.assignee) parts.push(`[담당: ${step.assignee}]`);
+      if (step.dueDate) parts.push(`[기한: ${step.dueDate}]`);
+      paragraphs.push(
+        new Paragraph({
+          indent: { left: 240 },
+          spacing: { after: 60 },
+          children: [text(`${index + 1}. ${parts.join(" ")}`)],
+        }),
+      );
+    }
+  }
+
+  if (summary?.nextSteps?.length) {
     paragraphs.push(
       new Paragraph({
         spacing: { before: 300, after: 100 },
-        children: [text("다음 단계 / 후속 조치", { bold: true, size: 22 })],
+        children: [text("4. 후속 조치", { bold: true, size: 22 })],
       }),
     );
 
-    for (const step of meeting.summary.nextSteps) {
+    for (const [index, step] of summary.nextSteps.entries()) {
       const parts: string[] = [step.content];
       if (step.assignee) parts.push(`[담당: ${step.assignee}]`);
       if (step.dueDate) parts.push(`[기한: ${step.dueDate}]`);
@@ -393,7 +456,26 @@ function buildContentParagraphs(meeting: MeetingDetail): Paragraph[] {
         new Paragraph({
           indent: { left: 240 },
           spacing: { after: 60 },
-          children: [text(`☐ ${parts.join(" ")}`)],
+          children: [text(`${index + 1}. ${parts.join(" ")}`)],
+        }),
+      );
+    }
+  }
+
+  if (summary?.reviewNotes?.length) {
+    paragraphs.push(
+      new Paragraph({
+        spacing: { before: 300, after: 100 },
+        children: [text(`${reviewNotesSectionNumber}. 요약 확인 사항`, { bold: true, size: 22 })],
+      }),
+    );
+
+    for (const note of summary.reviewNotes) {
+      paragraphs.push(
+        new Paragraph({
+          indent: { left: 240 },
+          spacing: { after: 60 },
+          children: [text(`● ${note}`)],
         }),
       );
     }

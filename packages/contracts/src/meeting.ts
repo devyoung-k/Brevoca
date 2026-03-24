@@ -25,7 +25,10 @@ export interface DiscussionTopic {
 
 export interface MeetingSummary {
   markdown: string;
+  objective: string | null;
+  conclusions: string[];
   nextSteps: ActionItem[];
+  reviewNotes: string[];
   topics: DiscussionTopic[];
 }
 

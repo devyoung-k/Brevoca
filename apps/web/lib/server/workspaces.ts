@@ -1,9 +1,13 @@
 import "server-only";
 
 import {
+  defaultPromptTemplateId,
+  type PromptTemplateId,
   type CreateWorkspaceResponse,
   type CurrentUserResponse,
   type WorkspaceDetailResponse,
+  type WorkspaceDefaultLanguage,
+  type WorkspaceExportFormat,
   type WorkspaceInvitationRecord,
   type WorkspaceMemberRecord,
   type WorkspaceMemberRole,
@@ -22,7 +26,12 @@ interface ProfileRow {
 interface WorkspaceRow {
   id: string;
   name: string;
+  description: string;
+  glossary_text: string;
   owner_id: string;
+  default_language: WorkspaceDefaultLanguage;
+  default_prompt_template_id: PromptTemplateId;
+  default_export_format: WorkspaceExportFormat;
   created_at: string;
   updated_at: string;
 }
@@ -62,7 +71,12 @@ function mapWorkspace(row: WorkspaceRow, role: WorkspaceMemberRole): WorkspaceRe
   return {
     id: row.id,
     name: row.name,
+    description: row.description,
+    glossaryText: row.glossary_text,
     role,
+    defaultLanguage: row.default_language,
+    defaultPromptTemplateId: row.default_prompt_template_id,
+    defaultExportFormat: row.default_export_format,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -75,6 +89,21 @@ function mapInvitation(row: WorkspaceInvitationRow): WorkspaceInvitationRecord {
     role: row.role,
     invitedByUserId: row.invited_by_user_id,
     createdAt: row.created_at,
+  };
+}
+
+function mapMember(
+  membership: WorkspaceMembershipRow,
+  profile: MembershipProfileRow | null | undefined,
+): WorkspaceMemberRecord {
+  const email = profile?.email ?? null;
+
+  return {
+    userId: membership.user_id,
+    email,
+    displayName: buildDisplayName(email),
+    role: membership.role,
+    joinedAt: membership.created_at,
   };
 }
 
@@ -202,6 +231,11 @@ export async function createWorkspaceForUser(
       .from("workspaces")
       .insert({
         name: trimmedName,
+        description: "",
+        glossary_text: "",
+        default_language: "ko",
+        default_prompt_template_id: defaultPromptTemplateId,
+        default_export_format: "markdown",
         owner_id: user.id,
       })
       .select("*")
@@ -312,17 +346,7 @@ export async function getWorkspaceDetailForUser(
     ((profileRows ?? []) as MembershipProfileRow[]).map((profile) => [profile.id, profile]),
   );
 
-  const members: WorkspaceMemberRecord[] = memberships.map((item) => {
-    const profile = profileByUserId.get(item.user_id);
-    const email = profile?.email ?? null;
-    return {
-      userId: item.user_id,
-      email,
-      displayName: buildDisplayName(email),
-      role: item.role,
-      joinedAt: item.created_at,
-    };
-  });
+  const members: WorkspaceMemberRecord[] = memberships.map((item) => mapMember(item, profileByUserId.get(item.user_id)));
 
   const { data: invitationRows, error: invitationError } = await supabase
     .from("workspace_invitations")
@@ -346,15 +370,27 @@ export async function getWorkspaceDetailForUser(
   };
 }
 
-export async function renameWorkspaceForUser(
+interface UpdateWorkspaceSettingsInput {
+  name: string;
+  description: string;
+  glossaryText: string;
+  defaultLanguage: WorkspaceDefaultLanguage;
+  defaultPromptTemplateId: PromptTemplateId;
+  defaultExportFormat: WorkspaceExportFormat;
+}
+
+export async function updateWorkspaceSettingsForUser(
   user: UserIdentity,
   workspaceId: string,
-  name: string,
+  input: UpdateWorkspaceSettingsInput,
 ): Promise<WorkspaceRecord> {
-  const trimmedName = name.trim();
+  const trimmedName = input.name.trim();
   if (!trimmedName) {
     throw new Error("Workspace name is required");
   }
+
+  const normalizedDescription = input.description.trim();
+  const normalizedGlossaryText = input.glossaryText.trim();
 
   const supabase = getSupabaseAdmin();
   const membership = await requireSingle<WorkspaceMembershipRow>(
@@ -376,6 +412,11 @@ export async function renameWorkspaceForUser(
       .from("workspaces")
       .update({
         name: trimmedName,
+        description: normalizedDescription,
+        glossary_text: normalizedGlossaryText,
+        default_language: input.defaultLanguage,
+        default_prompt_template_id: input.defaultPromptTemplateId,
+        default_export_format: input.defaultExportFormat,
         updated_at: new Date().toISOString(),
       })
       .eq("id", workspaceId)
@@ -385,6 +426,58 @@ export async function renameWorkspaceForUser(
   );
 
   return mapWorkspace(workspace, membership.role);
+}
+
+export async function getWorkspaceGlossaryText(
+  workspaceId: string | null | undefined,
+): Promise<string> {
+  if (!workspaceId) {
+    return "";
+  }
+
+  const supabase = getSupabaseAdmin();
+  const { data, error } = await supabase
+    .from("workspaces")
+    .select("glossary_text")
+    .eq("id", workspaceId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to load workspace glossary: ${error.message}`);
+  }
+
+  return ((data as { glossary_text?: string | null } | null)?.glossary_text ?? "").trim();
+}
+
+export async function deleteWorkspaceForOwner(
+  user: UserIdentity,
+  workspaceId: string,
+): Promise<CurrentUserResponse> {
+  const supabase = getSupabaseAdmin();
+  const membership = await requireSingle<WorkspaceMembershipRow>(
+    supabase
+      .from("workspace_memberships")
+      .select("*")
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", user.id)
+      .single(),
+    "Failed to verify workspace membership",
+  );
+
+  if (membership.role !== "owner") {
+    throw new Error("Only workspace owners can delete the workspace");
+  }
+
+  const { error } = await supabase
+    .from("workspaces")
+    .delete()
+    .eq("id", workspaceId);
+
+  if (error) {
+    throw new Error(`Failed to delete workspace: ${error.message}`);
+  }
+
+  return getCurrentUserState(user);
 }
 
 export async function inviteMemberToWorkspace(
@@ -471,6 +564,131 @@ export async function inviteMemberToWorkspace(
   );
 
   return mapInvitation(invitation);
+}
+
+export async function createWorkspaceMemberAccountForOwner(
+  user: UserIdentity,
+  workspaceId: string,
+  email: string,
+  password: string,
+): Promise<WorkspaceMemberRecord> {
+  const supabase = getSupabaseAdmin();
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail) {
+    throw new Error("Account email is required");
+  }
+
+  if (password.length < 8) {
+    throw new Error("Password must be at least 8 characters");
+  }
+
+  const ownerMembership = await requireSingle<WorkspaceMembershipRow>(
+    supabase
+      .from("workspace_memberships")
+      .select("*")
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", user.id)
+      .single(),
+    "Failed to verify workspace membership",
+  );
+
+  if (ownerMembership.role !== "owner") {
+    throw new Error("Only workspace owners can create member accounts");
+  }
+
+  const { data: existingProfile, error: existingProfileError } = await supabase
+    .from("profiles")
+    .select("id, email")
+    .eq("email", normalizedEmail)
+    .maybeSingle();
+
+  if (existingProfileError) {
+    throw new Error(`Failed to verify account email: ${existingProfileError.message}`);
+  }
+
+  if (existingProfile?.id) {
+    const { data: existingMembership, error: existingMembershipError } = await supabase
+      .from("workspace_memberships")
+      .select("*")
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", existingProfile.id)
+      .maybeSingle();
+
+    if (existingMembershipError) {
+      throw new Error(`Failed to verify existing membership: ${existingMembershipError.message}`);
+    }
+
+    if (existingMembership) {
+      throw new Error("That user is already a workspace member");
+    }
+
+    throw new Error("An account already exists for that email. Use the invitation flow instead.");
+  }
+
+  const { data: createdUserData, error: createUserError } = await supabase.auth.admin.createUser({
+    email: normalizedEmail,
+    password,
+    email_confirm: true,
+  });
+
+  if (createUserError || !createdUserData.user) {
+    const message = createUserError?.message ?? "no user returned";
+    if (message.toLowerCase().includes("already")) {
+      throw new Error("An account already exists for that email. Use the invitation flow instead.");
+    }
+    throw new Error(`Failed to create account: ${message}`);
+  }
+
+  const createdUser = createdUserData.user;
+  try {
+    const profile = await ensureProfile({
+      id: createdUser.id,
+      email: createdUser.email ?? normalizedEmail,
+    });
+
+    const membership = await requireSingle<WorkspaceMembershipRow>(
+      supabase
+        .from("workspace_memberships")
+        .insert({
+          workspace_id: workspaceId,
+          user_id: createdUser.id,
+          role: "member",
+        })
+        .select("*")
+        .single(),
+      "Failed to create workspace membership",
+    );
+
+    await updateDefaultWorkspace(createdUser.id, workspaceId);
+
+    const { error: revokeInvitationError } = await supabase
+      .from("workspace_invitations")
+      .update({
+        revoked_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("workspace_id", workspaceId)
+      .eq("email", normalizedEmail)
+      .is("accepted_at", null)
+      .is("revoked_at", null);
+
+    if (revokeInvitationError) {
+      throw new Error(`Failed to clean up existing invitations: ${revokeInvitationError.message}`);
+    }
+
+    return mapMember(membership, {
+      id: profile.id,
+      email: profile.email,
+    });
+  } catch (error) {
+    const { error: deleteUserError } = await supabase.auth.admin.deleteUser(createdUser.id);
+    if (deleteUserError) {
+      console.error("Failed to roll back account creation", deleteUserError);
+    }
+
+    throw error;
+  }
 }
 
 export async function revokeInvitationForWorkspace(

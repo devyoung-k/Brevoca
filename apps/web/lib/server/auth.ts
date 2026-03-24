@@ -25,6 +25,18 @@ export async function requireRequestUser(request: Request): Promise<RequestUser>
   };
 }
 
+export function requireAdminUser(user: Pick<RequestUser, "email">): void {
+  const adminEmails = getAdminEmails();
+  if (adminEmails.size === 0) {
+    throw new Error("AdminConfigMissing");
+  }
+
+  const normalizedEmail = user.email?.trim().toLowerCase();
+  if (!normalizedEmail || !adminEmails.has(normalizedEmail)) {
+    throw new Error("ForbiddenAdmin");
+  }
+}
+
 export function getWorkspaceId(request: Request): string | null {
   const value = request.headers.get("x-workspace-id")?.trim();
   return value || null;
@@ -46,4 +58,18 @@ function getBearerToken(request: Request): string | null {
 
   const token = value.slice("Bearer ".length).trim();
   return token || null;
+}
+
+function getAdminEmails(): Set<string> {
+  const rawValue =
+    process.env.BREVOCA_ADMIN_EMAILS ??
+    process.env.ADMIN_EMAILS ??
+    "";
+
+  return new Set(
+    rawValue
+      .split(",")
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean),
+  );
 }

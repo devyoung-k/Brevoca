@@ -16,6 +16,7 @@ interface AppSessionContextValue {
   refresh: () => Promise<void>;
   createWorkspace: (name: string) => Promise<WorkspaceRecord>;
   selectWorkspace: (workspaceId: string) => Promise<void>;
+  deleteWorkspace: (workspaceId: string) => Promise<void>;
   signOut: () => Promise<void>;
 }
 
@@ -128,6 +129,21 @@ export function AppSessionProvider({ children }: { children: ReactNode }) {
     setCurrentWorkspaceId(payload.currentWorkspaceId);
   }
 
+  async function deleteWorkspace(workspaceId: string) {
+    const response = await authedFetch(`/api/workspaces/${workspaceId}`, {
+      method: "DELETE",
+    });
+
+    if (!response.ok) {
+      throw new Error(await getResponseError(response));
+    }
+
+    const payload = (await response.json()) as CurrentUserResponse;
+    setUser(payload.user);
+    setWorkspaces(payload.workspaces);
+    setCurrentWorkspaceId(payload.currentWorkspaceId);
+  }
+
   async function signOut() {
     const supabase = getBrowserSupabaseClient();
     await supabase.auth.signOut();
@@ -151,6 +167,7 @@ export function AppSessionProvider({ children }: { children: ReactNode }) {
     refresh: refreshFromSession,
     createWorkspace,
     selectWorkspace,
+    deleteWorkspace,
     signOut,
   };
 
