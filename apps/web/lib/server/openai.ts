@@ -645,6 +645,16 @@ async function getFFmpegPath(): Promise<string> {
 
 async function loadFfmpegStaticPath(): Promise<string | null> {
   try {
+    const requiredPath = require("ffmpeg-static") as string | null;
+    if (requiredPath) {
+      await fs.access(requiredPath);
+      return requiredPath;
+    }
+  } catch {
+    // noop
+  }
+
+  try {
     const imported = await import("ffmpeg-static");
     const ffmpegPath = imported.default as unknown as string | null;
     if (!ffmpegPath) {
