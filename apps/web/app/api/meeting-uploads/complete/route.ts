@@ -8,6 +8,7 @@ import { requireRequestUser, requireWorkspaceId } from "@/lib/server/auth";
 import { startMeetingProcessing } from "@/lib/server/process-meeting";
 import {
   buildMeetingAudioChunkPrefix,
+  buildMeetingAudioStorageKey,
   createMeeting,
   requireWorkspaceMembership,
 } from "@/lib/server/store";
@@ -42,11 +43,15 @@ export async function POST(request: Request) {
     const tags = normalizeTags(body.tags);
     const durationSec = normalizeDuration(body.durationSec);
     const totalChunks = normalizeChunkCount(body.totalChunks);
+    const storageKey =
+      totalChunks > 1
+        ? buildMeetingAudioChunkPrefix(uploadId)
+        : buildMeetingAudioStorageKey(uploadId, fileName);
 
     const response = await createMeeting({
       workspaceId,
       meetingId: uploadId,
-      storageKey: buildMeetingAudioChunkPrefix(uploadId),
+      storageKey,
       audioChunkCount: totalChunks,
       fileName,
       title,
@@ -115,7 +120,7 @@ function normalizeTags(value: unknown): string[] {
 }
 
 function normalizeChunkCount(value: number | undefined) {
-  if (!Number.isInteger(value) || Number(value) <= 1) {
+  if (!Number.isInteger(value) || Number(value) <= 0) {
     throw new Error("InvalidChunkCount");
   }
 

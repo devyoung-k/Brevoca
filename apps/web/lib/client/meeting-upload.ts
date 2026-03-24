@@ -2,6 +2,7 @@
 
 import type { MeetingCreateResponse, MeetingSourceType, PromptTemplateId } from "@brevoca/contracts";
 import { authedFetch } from "@/lib/client/authed-fetch";
+import { getBrowserSupabaseClient } from "@/lib/supabase/client";
 import {
   AUDIO_UPLOAD_CHUNK_BYTES,
   MAX_AUDIO_STORAGE_OBJECT_BYTES,
@@ -22,41 +23,48 @@ export async function uploadMeetingAudio(
   input: UploadMeetingAudioInput,
 ): Promise<MeetingCreateResponse> {
   if (input.file.size <= MAX_AUDIO_STORAGE_OBJECT_BYTES) {
-    return uploadSingleFile(input);
+    return uploadSingleFileDirect(input);
   }
 
-  return uploadChunkedFile(input);
+  return uploadChunkedFileDirect(input);
 }
 
-async function uploadSingleFile(
+async function uploadSingleFileDirect(
   input: UploadMeetingAudioInput,
 ): Promise<MeetingCreateResponse> {
+  const uploadId = crypto.randomUUID();
   input.onProgress?.(10);
-  const formData = new FormData();
-  formData.append("file", input.file);
-  formData.append("title", input.title);
-  formData.append("language", input.language);
-  formData.append("promptTemplateId", input.promptTemplateId);
-  formData.append("sourceType", input.sourceType);
-  formData.append("tags", JSON.stringify(input.tags ?? []));
-  if (input.durationSec) {
-    formData.append("durationSec", String(input.durationSec));
-  }
 
-  const response = await authedFetch("/api/meetings", {
-    method: "POST",
-    body: formData,
+  const signedUpload = await createSignedUpload({
+    uploadId,
+    fileName: input.file.name,
   });
 
-  if (!response.ok) {
-    throw new Error(await getResponseError(response));
-  }
+  await uploadFileToStorage(
+    signedUpload.bucket,
+    signedUpload.path,
+    signedUpload.token,
+    input.file,
+    input.file.type || undefined,
+  );
 
-  input.onProgress?.(100);
-  return (await response.json()) as MeetingCreateResponse;
+  input.onProgress?.(85);
+
+  return finalizeUpload({
+    uploadId,
+    totalChunks: 1,
+    fileName: input.file.name,
+    title: input.title,
+    language: input.language,
+    promptTemplateId: input.promptTemplateId,
+    sourceType: input.sourceType,
+    tags: input.tags ?? [],
+    durationSec: input.durationSec ?? null,
+    onProgress: input.onProgress,
+  });
 }
 
-async function uploadChunkedFile(
+async function uploadChunkedFileDirect(
   input: UploadMeetingAudioInput,
 ): Promise<MeetingCreateResponse> {
   const uploadId = crypto.randomUUID();
@@ -67,19 +75,20 @@ async function uploadChunkedFile(
     const start = chunkIndex * AUDIO_UPLOAD_CHUNK_BYTES;
     const end = Math.min(start + AUDIO_UPLOAD_CHUNK_BYTES, input.file.size);
     const chunk = input.file.slice(start, end);
-    const formData = new FormData();
-    formData.append("chunk", chunk, `${input.file.name}.part`);
-    formData.append("uploadId", uploadId);
-    formData.append("chunkIndex", String(chunkIndex));
 
-    const response = await authedFetch("/api/meeting-uploads/chunks", {
-      method: "POST",
-      body: formData,
+    const signedUpload = await createSignedUpload({
+      uploadId,
+      fileName: input.file.name,
+      chunkIndex,
     });
 
-    if (!response.ok) {
-      throw new Error(await getResponseError(response));
-    }
+    await uploadFileToStorage(
+      signedUpload.bucket,
+      signedUpload.path,
+      signedUpload.token,
+      chunk,
+      "application/octet-stream",
+    );
 
     uploadedBytes += chunk.size;
     input.onProgress?.(
@@ -87,18 +96,91 @@ async function uploadChunkedFile(
     );
   }
 
+  return finalizeUpload({
+    uploadId,
+    totalChunks,
+    fileName: input.file.name,
+    title: input.title,
+    language: input.language,
+    promptTemplateId: input.promptTemplateId,
+    sourceType: input.sourceType,
+    tags: input.tags ?? [],
+    durationSec: input.durationSec ?? null,
+    onProgress: input.onProgress,
+  });
+}
+
+interface SignedUploadPayload {
+  bucket: string;
+  path: string;
+  token: string;
+}
+
+async function createSignedUpload(input: {
+  uploadId: string;
+  fileName: string;
+  chunkIndex?: number;
+}): Promise<SignedUploadPayload> {
+  const response = await authedFetch("/api/meeting-uploads/signed-url", {
+    method: "POST",
+    body: JSON.stringify({
+      uploadId: input.uploadId,
+      fileName: input.fileName,
+      chunkIndex: input.chunkIndex ?? null,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await getResponseError(response));
+  }
+
+  return (await response.json()) as SignedUploadPayload;
+}
+
+async function uploadFileToStorage(
+  bucket: string,
+  path: string,
+  token: string,
+  fileBody: Blob,
+  contentType?: string,
+) {
+  const supabase = getBrowserSupabaseClient();
+  const { error } = await supabase.storage
+    .from(bucket)
+    .uploadToSignedUrl(path, token, fileBody, {
+      contentType,
+      upsert: true,
+    });
+
+  if (error) {
+    throw new Error(`Storage upload failed: ${error.message}`);
+  }
+}
+
+async function finalizeUpload(input: {
+  uploadId: string;
+  totalChunks: number;
+  fileName: string;
+  title: string;
+  language: string;
+  promptTemplateId: PromptTemplateId;
+  sourceType: MeetingSourceType;
+  tags: string[];
+  durationSec: number | null;
+  onProgress?: (progress: number) => void;
+}): Promise<MeetingCreateResponse> {
   const finalizeResponse = await authedFetch("/api/meeting-uploads/complete", {
     method: "POST",
     body: JSON.stringify({
-      uploadId,
-      totalChunks,
-      fileName: input.file.name,
+      uploadId: input.uploadId,
+      totalChunks: input.totalChunks,
+      fileName: input.fileName,
       title: input.title,
       language: input.language,
       promptTemplateId: input.promptTemplateId,
       sourceType: input.sourceType,
-      tags: input.tags ?? [],
-      durationSec: input.durationSec ?? null,
+      tags: input.tags,
+      durationSec: input.durationSec,
     }),
   });
 
