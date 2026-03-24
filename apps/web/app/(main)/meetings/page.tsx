@@ -18,6 +18,7 @@ import { authedFetch } from "@/lib/client/authed-fetch";
 import { useAppSession } from "@/components/AppSessionProvider";
 
 type DateFilter = "all" | "today" | "week" | "month";
+const DATE_FILTER_OPTIONS: DateFilter[] = ["all", "today", "week", "month"];
 
 const statusConfig: Record<
   MeetingRecord["status"],
@@ -165,7 +166,7 @@ function SearchContent({
             <h3 className="font-medium">날짜 필터</h3>
           </div>
           <div className="flex flex-wrap gap-2">
-            {["all", "today", "week", "month"].map((period) => (
+            {DATE_FILTER_OPTIONS.map((period) => (
               <button
                 key={period}
                 onClick={() => setDateFilter(period)}

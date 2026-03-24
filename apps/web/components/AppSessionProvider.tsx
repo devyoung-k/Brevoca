@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import type { CurrentUser, CurrentUserResponse, WorkspaceRecord } from "@brevoca/contracts";
 import type { Session } from "@supabase/supabase-js";
 import { authedFetch, setCurrentWorkspaceId as syncWorkspaceId } from "@/lib/client/authed-fetch";
@@ -28,22 +28,7 @@ export function AppSessionProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [currentWorkspaceId, setCurrentWorkspaceId] = useState<string | null>(null);
 
-  useEffect(() => {
-    const supabase = getBrowserSupabaseClient();
-    void refreshFromSession();
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_, session) => {
-      void refreshFromSession(session);
-    });
-
-    return () => {
-      subscription.unsubscribe();
-    };
-  }, []);
-
-  async function refreshFromSession(sessionOverride?: Session | null) {
+  const refreshFromSession = useCallback(async (sessionOverride?: Session | null) => {
     const session =
       sessionOverride ??
       (
@@ -89,7 +74,24 @@ export function AppSessionProvider({ children }: { children: ReactNode }) {
     setUser(payload.user);
     setWorkspaces(payload.workspaces);
     setCurrentWorkspaceId(payload.currentWorkspaceId);
-  }
+  }, []);
+
+  useEffect(() => {
+    const supabase = getBrowserSupabaseClient();
+    queueMicrotask(() => {
+      void refreshFromSession();
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_, session) => {
+      void refreshFromSession(session);
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [refreshFromSession]);
 
   async function createWorkspace(name: string) {
     const response = await authedFetch("/api/workspaces", {
