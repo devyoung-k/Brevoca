@@ -1,6 +1,12 @@
+import type { PromptTemplateId } from "./prompts";
+
 export const workspaceMemberRoles = ["owner", "member"] as const;
+export const workspaceDefaultLanguages = ["ko", "en", "ja", "zh"] as const;
+export const workspaceExportFormats = ["markdown", "docx", "pdf"] as const;
 
 export type WorkspaceMemberRole = (typeof workspaceMemberRoles)[number];
+export type WorkspaceDefaultLanguage = (typeof workspaceDefaultLanguages)[number];
+export type WorkspaceExportFormat = (typeof workspaceExportFormats)[number];
 
 export interface CurrentUser {
   id: string;
@@ -11,7 +17,12 @@ export interface CurrentUser {
 export interface WorkspaceRecord {
   id: string;
   name: string;
+  description: string;
+  glossaryText: string;
   role: WorkspaceMemberRole;
+  defaultLanguage: WorkspaceDefaultLanguage;
+  defaultPromptTemplateId: PromptTemplateId;
+  defaultExportFormat: WorkspaceExportFormat;
   createdAt: string;
   updatedAt: string;
 }

@@ -9,7 +9,11 @@ import {
   promptTemplateIds,
   type PromptTemplateId,
 } from "@brevoca/contracts";
-import { authedFetch } from "@/lib/client/authed-fetch";
+import { uploadMeetingAudio } from "@/lib/client/meeting-upload";
+import {
+  MAX_AUDIO_UPLOAD_FILE_BYTES,
+  getAudioUploadTooLargeMessage,
+} from "@/lib/uploads";
 import { toast } from "sonner";
 
 type RecordingState = "idle" | "recording" | "paused" | "stopped";
@@ -145,41 +149,29 @@ export default function BrowserRecordingPage() {
       return;
     }
 
-    const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
-    if (recordedBlob.size > MAX_FILE_SIZE) {
-      toast.error("녹음 파일이 너무 큽니다. 최대 100MB까지 업로드할 수 있습니다.");
+    if (recordedBlob.size > MAX_AUDIO_UPLOAD_FILE_BYTES) {
+      toast.error(getAudioUploadTooLargeMessage("녹음 파일"));
       return;
     }
 
     setUploading(true);
     setUploadProgress(10);
-    const progressTimer = window.setInterval(() => {
-      setUploadProgress((current) => Math.min(current + 12, 90));
-    }, 250);
 
     try {
       const file = new File([recordedBlob], `${buildFileName(title)}.webm`, {
         type: recordedBlob.type || "audio/webm",
       });
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("title", title.trim() || "브라우저 녹음 회의");
-      formData.append("language", language);
-      formData.append("promptTemplateId", promptTemplateId);
-      formData.append("sourceType", "browser_recording");
-      formData.append("durationSec", String(duration));
-
-      const response = await authedFetch("/api/meetings", {
-        method: "POST",
-        body: formData,
+      const payload = await uploadMeetingAudio({
+        file,
+        title: title.trim() || "브라우저 녹음 회의",
+        language,
+        promptTemplateId,
+        sourceType: "browser_recording",
+        durationSec: duration,
+        onProgress: (progress) => {
+          setUploadProgress(progress);
+        },
       });
-
-      if (!response.ok) {
-        const errorMessage = await extractServerError(response);
-        throw new Error(errorMessage);
-      }
-
-      const payload = (await response.json()) as { jobId: string };
       setUploadProgress(100);
       toast.success("브라우저 녹음을 업로드했습니다.");
       router.push(`/processing/${payload.jobId}`);
@@ -188,8 +180,6 @@ export default function BrowserRecordingPage() {
       const message = error instanceof Error ? error.message : "녹음 업로드에 실패했습니다.";
       toast.error(message);
       setUploading(false);
-    } finally {
-      window.clearInterval(progressTimer);
     }
   };
 
@@ -448,17 +438,4 @@ function formatDuration(seconds: number): string {
 function buildFileName(title: string): string {
   const base = title.trim() || `recording-${new Date().toISOString().slice(0, 19)}`;
   return base.replace(/[^\w\-가-힣]+/g, "-");
-}
-
-async function extractServerError(response: Response): Promise<string> {
-  try {
-    const payload = (await response.json()) as { error?: string };
-    if (payload.error) {
-      return payload.error;
-    }
-  } catch {
-    // JSON 파싱 실패 시 텍스트로 fallback
-  }
-
-  return `녹음 업로드에 실패했습니다. (${response.status})`;
 }

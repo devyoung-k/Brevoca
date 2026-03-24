@@ -13,6 +13,10 @@ import {
   type PromptTemplateId,
   type TranscriptSegment,
 } from "@brevoca/contracts";
+import {
+  applyGlossaryToText,
+  buildGlossaryPrompt,
+} from "./glossary";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -20,14 +24,20 @@ const require = createRequire(import.meta.url);
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 const WHISPER_MAX_SIZE = 24 * 1024 * 1024; // 24MB (25MB 제한에 여유분)
 const TRANSCRIBE_MAX_DURATION_SEC = 1400; // OpenAI transcribe 모델 최대 길이 제한
-const DEFAULT_CHUNK_DURATION_SEC = 300; // 5분 단위 분할 (작은 청크 + 높은 병렬도)
+const DEFAULT_CHUNK_DURATION_SEC = 600; // 10분 단위 분할 (요약 호출 수 절감)
 const PREPROCESS_BITRATE = "48k"; // 음성 전사에 충분한 비트레이트
 const DEFAULT_TRANSCRIBE_CONCURRENCY = 4;
 const DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-transcribe";
 const DEFAULT_SUMMARY_MODEL = "gpt-5-mini";
 const OPENAI_TRANSCRIBE_RETRY_DELAYS_MS = [500, 1000, 2000];
+const OPENAI_SUMMARY_RETRY_DELAYS_MS = [1000, 2000];
 const OPENAI_RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_GLOBAL_TRANSCRIBE_CONCURRENCY = 8;
+const DEFAULT_SUMMARY_TIMEOUT_MS = 180_000;
+const REPETITIVE_TAIL_MIN_REPEATS = 30;
+const REPETITIVE_TAIL_MIN_CHARS = 60;
+const LOW_ENTROPY_DROP_MIN_CHARS = 160;
+const LOW_ENTROPY_DOMINANT_CHAR_RATIO = 0.82;
 
 // ── 타이밍 유틸 ──
 
@@ -77,7 +87,7 @@ function getGlobalTranscribeConcurrency(): number {
 }
 
 const SUMMARY_JSON_SHAPE =
-  '{"nextSteps":[{"content":string,"assignee":string|null,"dueDate":string|null}],"topics":[{"title":string,"points":[string]}]}';
+  '{"objective":string|null,"conclusions":[string],"nextSteps":[{"content":string,"assignee":string|null,"dueDate":string|null}],"reviewNotes":[string],"topics":[{"title":string,"points":[string]}]}';
 
 type OpenAiOperation = "transcription" | "summary";
 
@@ -116,12 +126,14 @@ interface DiarizedSegmentPayload {
 }
 
 export type TranscribeProgressCallback = (progress: number, message: string) => void | Promise<void>;
+export type SummaryProgressCallback = (progress: number, message: string) => void | Promise<void>;
 
 export async function transcribeAudioFile(options: {
   fileBuffer: Buffer;
   fileName: string;
   language: string;
   durationSec?: number | null;
+  glossaryText?: string;
   signal?: AbortSignal;
   onProgress?: TranscribeProgressCallback;
 }): Promise<TranscriptionResult> {
@@ -152,13 +164,27 @@ export async function transcribeAudioFile(options: {
   if (!needsChunking) {
     await report(22, "OpenAI 전사 API 호출 중");
     result = await timedStep("transcribe-single", () =>
-      transcribeSingleFile(buffer, fileName, options.language, options.signal),
+      transcribeSingleFile(
+        buffer,
+        fileName,
+        options.language,
+        options.glossaryText,
+        options.signal,
+      ),
     );
     await report(50, "전사 API 완료");
   } else {
     await report(22, "오디오 분할 준비 중");
     result = await timedStep("transcribe-chunked", () =>
-      transcribeChunked(buffer, fileName, options.language, durationSec, options.onProgress, options.signal),
+      transcribeChunked(
+        buffer,
+        fileName,
+        options.language,
+        durationSec,
+        options.glossaryText,
+        options.onProgress,
+        options.signal,
+      ),
     );
   }
 
@@ -206,18 +232,25 @@ async function transcribeSingleFile(
   fileBuffer: Buffer,
   fileName: string,
   language: string,
+  glossaryText?: string,
   signal?: AbortSignal,
 ): Promise<TranscriptionResult> {
   const model = getRequiredEnv("BREVOCA_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIBE_MODEL);
   const formData = new FormData();
   const blob = new Blob([new Uint8Array(fileBuffer)], { type: getMimeType(fileName) });
-  const includeDiarization = getBooleanEnv("BREVOCA_TRANSCRIBE_DIARIZATION", false);
+  const includeDiarization =
+    getBooleanEnv("BREVOCA_TRANSCRIBE_DIARIZATION", false) &&
+    model.toLowerCase().includes("diarize");
+  const glossaryPrompt = buildGlossaryPrompt(glossaryText ?? "");
 
   formData.append("model", model);
   formData.append("language", language);
   formData.append("file", blob, fileName);
   formData.append("response_format", includeDiarization ? "diarized_json" : "json");
   formData.append("chunking_strategy", "auto");
+  if (glossaryPrompt && !includeDiarization) {
+    formData.append("prompt", glossaryPrompt);
+  }
 
   const response = await fetchOpenAiWithRetry(
     "/audio/transcriptions",
@@ -241,11 +274,19 @@ async function transcribeSingleFile(
     throw new Error("OpenAI transcription response did not include text");
   }
 
-  const transcriptSegments = normalizeTranscriptSegments(payload.segments, payload.text);
+  const transcriptSegments = normalizeTranscriptSegments(
+    payload.segments,
+    payload.text,
+    glossaryText,
+  );
+  const transcriptText = applyGlossaryToText(
+    formatTranscriptText(transcriptSegments, payload.text),
+    glossaryText ?? "",
+  );
   return {
-    transcriptText: formatTranscriptText(transcriptSegments, payload.text),
+    transcriptText,
     transcriptSegments,
-    transcriptChunks: [payload.text?.trim() || formatTranscriptText(transcriptSegments, payload.text)],
+    transcriptChunks: [transcriptText],
   };
 }
 
@@ -254,6 +295,7 @@ async function transcribeChunked(
   fileName: string,
   language: string,
   totalDurationSec: number,
+  glossaryText: string | undefined,
   onProgress?: TranscribeProgressCallback,
   signal?: AbortSignal,
 ): Promise<TranscriptionResult> {
@@ -279,7 +321,14 @@ async function transcribeChunked(
       return report(progress, `청크 전사 중 (${completedCount}/${chunkPaths.length})`);
     };
 
-    const transcripts = await transcribeChunksInParallel(chunkPaths, language, chunkOffsets, chunkProgressFn, signal);
+    const transcripts = await transcribeChunksInParallel(
+      chunkPaths,
+      language,
+      chunkOffsets,
+      glossaryText,
+      chunkProgressFn,
+      signal,
+    );
 
     await report(50, "모든 청크 전사 완료");
     return mergeTranscriptionResults(transcripts);
@@ -292,6 +341,7 @@ async function transcribeChunksInParallel(
   chunkPaths: string[],
   language: string,
   chunkOffsets: number[],
+  glossaryText: string | undefined,
   onChunkComplete?: (completedCount: number) => void | Promise<void>,
   signal?: AbortSignal,
 ): Promise<TranscriptionResult[]> {
@@ -319,7 +369,13 @@ async function transcribeChunksInParallel(
           const chunkBuffer = await fs.readFile(chunkPath);
           const chunkName = path.basename(chunkPath);
           const chunkResult = await timedStep(`transcribe-chunk[${currentIndex}]`, () =>
-            transcribeSingleFile(chunkBuffer, chunkName, language, signal),
+            transcribeSingleFile(
+              chunkBuffer,
+              chunkName,
+              language,
+              glossaryText,
+              signal,
+            ),
           );
           const chunkOffsetSec = chunkOffsets[currentIndex] ?? 0;
           transcripts[currentIndex] = {
@@ -377,11 +433,16 @@ function mergeTranscriptionResults(results: TranscriptionResult[]): Transcriptio
 function normalizeTranscriptSegments(
   segments: DiarizedSegmentPayload[] | undefined,
   fallbackText?: string,
+  glossaryText = "",
 ): TranscriptSegment[] | null {
   const normalized = (segments ?? [])
     .map((segment) => {
-      const text = segment.text?.trim();
+      const rawText = applyGlossaryToText(segment.text?.trim() ?? "", glossaryText);
+      const text = sanitizeTranscriptText(rawText);
       if (!text) {
+        if (rawText) {
+          logTranscriptSanitization("Dropped degenerate segment", rawText);
+        }
         return null;
       }
 
@@ -398,8 +459,12 @@ function normalizeTranscriptSegments(
     return normalized;
   }
 
-  const text = fallbackText?.trim();
+  const rawText = applyGlossaryToText(fallbackText?.trim() ?? "", glossaryText);
+  const text = sanitizeTranscriptText(rawText);
   if (!text) {
+    if (rawText) {
+      logTranscriptSanitization("Dropped degenerate fallback transcript", rawText);
+    }
     return null;
   }
 
@@ -418,7 +483,7 @@ function formatTranscriptText(
   fallbackText?: string,
 ): string {
   if (!segments?.length) {
-    return fallbackText?.trim() || "";
+    return sanitizeTranscriptText(fallbackText?.trim() ?? "");
   }
 
   const speakerLabels = new Map<string, string>();
@@ -440,6 +505,99 @@ function formatTranscriptText(
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function sanitizeTranscriptText(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const withoutRepeatedTail = stripRepeatedTail(trimmed);
+  if (!withoutRepeatedTail) {
+    return "";
+  }
+
+  if (isLowEntropyTranscript(withoutRepeatedTail)) {
+    return "";
+  }
+
+  if (withoutRepeatedTail !== trimmed) {
+    logTranscriptSanitization("Trimmed repetitive transcript tail", trimmed);
+  }
+
+  return withoutRepeatedTail;
+}
+
+function stripRepeatedTail(text: string): string {
+  let bestCutIndex = text.length;
+
+  for (let unitLength = 1; unitLength <= 3; unitLength += 1) {
+    if (text.length < unitLength * REPETITIVE_TAIL_MIN_REPEATS) {
+      continue;
+    }
+
+    const unit = text.slice(text.length - unitLength);
+    if (!unit || /\s/u.test(unit)) {
+      continue;
+    }
+
+    let cursor = text.length;
+    let repeats = 0;
+
+    while (cursor - unitLength >= 0) {
+      const chunk = text.slice(cursor - unitLength, cursor);
+      if (chunk !== unit) {
+        break;
+      }
+
+      repeats += 1;
+      cursor -= unitLength;
+    }
+
+    const repeatedLength = text.length - cursor;
+    if (
+      repeats >= REPETITIVE_TAIL_MIN_REPEATS &&
+      repeatedLength >= REPETITIVE_TAIL_MIN_CHARS
+    ) {
+      bestCutIndex = Math.min(bestCutIndex, cursor);
+    }
+  }
+
+  if (bestCutIndex === text.length) {
+    return text;
+  }
+
+  return text
+    .slice(0, bestCutIndex)
+    .replace(/[\s,.;:!?~)\]}]+$/u, "")
+    .trim();
+}
+
+function isLowEntropyTranscript(text: string): boolean {
+  const visibleCharacters = Array.from(text.replace(/\s+/gu, ""));
+  if (visibleCharacters.length < LOW_ENTROPY_DROP_MIN_CHARS) {
+    return false;
+  }
+
+  const counts = new Map<string, number>();
+  for (const character of visibleCharacters) {
+    counts.set(character, (counts.get(character) ?? 0) + 1);
+  }
+
+  let dominantCharacterCount = 0;
+  for (const count of counts.values()) {
+    if (count > dominantCharacterCount) {
+      dominantCharacterCount = count;
+    }
+  }
+
+  return dominantCharacterCount / visibleCharacters.length >= LOW_ENTROPY_DOMINANT_CHAR_RATIO;
+}
+
+function logTranscriptSanitization(message: string, text: string): void {
+  const snippet = Array.from(text).slice(0, 80).join("");
+  console.warn(`[brevoca:transcript] ${message}: ${snippet}${text.length > snippet.length ? "..." : ""}`);
 }
 
 function getSpeakerLabel(
@@ -714,23 +872,48 @@ export async function summarizeTranscript(options: {
   transcriptText: string;
   transcriptChunks?: string[];
   promptTemplateId: PromptTemplateId;
+  glossaryText?: string;
   signal?: AbortSignal;
+  onProgress?: SummaryProgressCallback;
 }): Promise<MeetingSummary> {
   const promptTemplate = promptTemplates[options.promptTemplateId] ?? promptTemplates[defaultPromptTemplateId];
   const transcriptChunks = normalizeTranscriptChunks(options.transcriptChunks, options.transcriptText);
+  const report = options.onProgress ?? (() => {});
+  const glossaryInstructions = buildGlossaryPrompt(options.glossaryText ?? "");
 
   if (transcriptChunks.length <= 1) {
+    await report(72, "OpenAI 요약 API 호출 중");
     return summarizeFromText({
       title: options.title,
       language: options.language,
-      promptTemplate,
+      promptTemplate: appendGlossaryInstructions(promptTemplate, glossaryInstructions),
       transcriptText: options.transcriptText,
       signal: options.signal,
     });
   }
 
-  const chunkSummaries = await summarizeChunks(options.title, options.language, promptTemplate, transcriptChunks, options.signal);
-  const summary = await mergeChunkSummaries(options.title, options.language, promptTemplate, chunkSummaries, options.signal);
+  await report(72, `요약용 전사 청크 ${transcriptChunks.length}개를 처리합니다`);
+  const chunkSummaries = await summarizeChunks(
+    options.title,
+    options.language,
+    appendGlossaryInstructions(promptTemplate, glossaryInstructions),
+    transcriptChunks,
+    options.signal,
+    (completedCount, totalCount) => {
+      const ratio = completedCount / totalCount;
+      const progress = Math.round(72 + ratio * 18);
+      return report(progress, `요약 청크 처리 중 (${completedCount}/${totalCount})`);
+    },
+  );
+  await report(92, "청크 요약 병합 중");
+  const summary = await mergeChunkSummaries(
+    options.title,
+    options.language,
+    appendGlossaryInstructions(promptTemplate, glossaryInstructions),
+    chunkSummaries,
+    options.signal,
+  );
+  await report(96, "최종 요약 정리 완료");
 
   return {
     ...summary,
@@ -754,7 +937,7 @@ async function summarizeFromText(options: {
     ),
     options.signal,
   );
-  const summary = parseSummaryJson(text);
+  const summary = await parseSummaryJsonWithRepair(text, options.signal);
 
   return {
     ...summary,
@@ -768,10 +951,12 @@ async function summarizeChunks(
   promptTemplate: string,
   transcriptChunks: string[],
   signal?: AbortSignal,
+  onChunkComplete?: (completedCount: number, totalCount: number) => void | Promise<void>,
 ): Promise<Array<Omit<MeetingSummary, "markdown">>> {
   const limit = Math.min(getSummaryChunkConcurrency(), transcriptChunks.length);
   const summaries = new Array<Omit<MeetingSummary, "markdown">>(transcriptChunks.length);
   let nextIndex = 0;
+  let completedCount = 0;
 
   const workers = Array.from({ length: limit }, async () => {
     while (true) {
@@ -786,7 +971,9 @@ async function summarizeChunks(
         buildChunkSummaryPrompt(title, language, promptTemplate, currentIndex + 1, transcriptChunks.length, transcriptChunks[currentIndex]),
         signal,
       );
-      summaries[currentIndex] = parseSummaryJson(text);
+      summaries[currentIndex] = await parseSummaryJsonWithRepair(text, signal);
+      completedCount += 1;
+      await onChunkComplete?.(completedCount, transcriptChunks.length);
     }
   });
 
@@ -804,10 +991,19 @@ async function mergeChunkSummaries(
   const chunkSummaryText = chunkSummaries
     .map((summary, index) => {
       const lines = [`Chunk ${index + 1}`];
+      if (summary.objective) {
+        lines.push(`Objective: ${summary.objective}`);
+      }
       if (summary.nextSteps.length > 0) {
         lines.push(
           `NextSteps: ${summary.nextSteps.map((item) => `${item.content} / 담당: ${item.assignee ?? "미정"} / 기한: ${item.dueDate ?? "미정"}`).join(" | ")}`,
         );
+      }
+      if (summary.conclusions.length > 0) {
+        lines.push(`Conclusions: ${summary.conclusions.join(" | ")}`);
+      }
+      if (summary.reviewNotes.length > 0) {
+        lines.push(`ReviewNotes: ${summary.reviewNotes.join(" | ")}`);
       }
       for (const topic of summary.topics) {
         lines.push(`Topic [${topic.title}]: ${topic.points.join(" | ")}`);
@@ -822,10 +1018,14 @@ async function mergeChunkSummaries(
       `Use this JSON shape: ${SUMMARY_JSON_SHAPE}.`,
       "Do not wrap the JSON in markdown fences.",
       "You are merging structured chunk summaries from one meeting transcript.",
+      "Produce a formal meeting-minutes structure with these sections: 1. 회의 목적, 2. 주요 논의 사항, 3. 회의 결론, and a final 요약 확인 사항 section when needed.",
       "Merge topics with similar titles into a single topic, combining all their points.",
       "Preserve all unique points from each chunk — do not drop any information.",
       "Deduplicate only truly identical points.",
+      "The objective should explain the purpose/background of the meeting in 1-3 sentences.",
+      "The conclusions should read like numbered end-of-meeting conclusions, not raw action items.",
       "Keep nextSteps concrete and actionable. Leave unclear assignee or dueDate as null.",
+      "Items that are only caveats, ASR ambiguity, name confusion, or facts requiring later confirmation should go to reviewNotes, not topics.",
       "",
       "Meeting title:",
       title,
@@ -842,10 +1042,16 @@ async function mergeChunkSummaries(
     signal,
   );
 
-  return parseSummaryJson(text);
+  return parseSummaryJsonWithRepair(text, signal);
 }
 
 async function requestSummaryText(input: string, signal?: AbortSignal): Promise<string> {
+  const summarySignal = createTimeoutSignal(
+    signal,
+    getSummaryTimeoutMs(),
+    "OpenAI 요약 API 호출이 시간 안에 완료되지 않았습니다.",
+  );
+
   const response = await fetchOpenAiWithRetry(
     "/responses",
     {
@@ -854,7 +1060,7 @@ async function requestSummaryText(input: string, signal?: AbortSignal): Promise<
         ...getOpenAiHeaders(),
         "Content-Type": "application/json",
       },
-      signal,
+      signal: summarySignal,
       body: JSON.stringify({
         model: getRequiredEnv("BREVOCA_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL),
         input,
@@ -862,6 +1068,7 @@ async function requestSummaryText(input: string, signal?: AbortSignal): Promise<
     },
     {
       operation: "summary",
+      retryDelaysMs: OPENAI_SUMMARY_RETRY_DELAYS_MS,
     },
   );
 
@@ -884,7 +1091,13 @@ function buildTranscriptSummaryPrompt(
     `Use this JSON shape: ${SUMMARY_JSON_SHAPE}.`,
     "Do not wrap the JSON in markdown fences.",
     "The transcript may contain ASR noise or duplicated fragments.",
+    "Write the summary as formal meeting minutes with these sections: 1. 회의 목적, 2. 주요 논의 사항, 3. 회의 결론, and a final 요약 확인 사항 section when needed.",
+    "Set objective to a 1-3 sentence description of why the meeting was held and what operational context it addressed.",
     "Identify all distinct topics discussed and capture every opinion, decision, observation, and background context under the appropriate topic.",
+    "Treat each topic as a sub-item under '2. 주요 논의 사항' and make the title read like an agenda heading.",
+    "Write topic points as complete sentences that can be rendered as bullet points under the topic.",
+    "Set conclusions to the final agreed directions, decisions, or required follow-up conclusions that belong under '3. 회의 결론'.",
+    "Items that are only caveats, ASR ambiguity, name confusion, or facts requiring later confirmation should go to reviewNotes, not topics.",
     "Do not drop any discussion point — comprehensiveness is more important than brevity.",
     "Do not invent facts that are not supported by the transcript.",
     "",
@@ -916,7 +1129,13 @@ function buildChunkSummaryPrompt(
     "Do not wrap the JSON in markdown fences.",
     "You are summarizing one chunk of a longer meeting transcript.",
     "The transcript may contain ASR noise, filler, and repeated phrases.",
+    "Write in a formal meeting-minutes style that will later be rendered as: 1. 회의 목적, 2. 주요 논의 사항, 3. 회의 결론, and a final 요약 확인 사항 section when needed.",
+    "Set objective only when this chunk contains enough context to infer the meeting purpose; otherwise use null.",
     "Identify topics discussed in this chunk and capture all opinions, observations, and context.",
+    "Treat each topic as a sub-item under '2. 주요 논의 사항' and make the title read like an agenda heading.",
+    "Write topic points as complete sentences that can be rendered as bullet points under the topic.",
+    "If this chunk contains clear conclusions or agreed directions, include them in conclusions.",
+    "Items that are only caveats, ASR ambiguity, name confusion, or facts requiring later confirmation should go to reviewNotes, not topics.",
     "Do not drop any discussion point — comprehensiveness is more important than brevity.",
     "If a field is not applicable in this chunk, leave it as an empty array.",
     "",
@@ -969,14 +1188,91 @@ function extractResponseText(payload: {
   return text;
 }
 
+async function parseSummaryJsonWithRepair(
+  raw: string,
+  signal?: AbortSignal,
+): Promise<Omit<MeetingSummary, "markdown">> {
+  for (const candidate of buildSummaryJsonCandidates(raw)) {
+    try {
+      return parseSummaryJson(candidate);
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  const repaired = await repairSummaryJson(raw, signal);
+  for (const candidate of buildSummaryJsonCandidates(repaired)) {
+    try {
+      return parseSummaryJson(candidate);
+    } catch {
+      // Keep trying until candidates are exhausted.
+    }
+  }
+
+  return parseSummaryJson(raw);
+}
+
 function parseSummaryJson(raw: string): Omit<MeetingSummary, "markdown"> {
-  const normalized = raw.replace(/^```json\s*|\s*```$/g, "").trim();
+  const normalized = raw.trim();
   const parsed = JSON.parse(normalized) as Partial<Omit<MeetingSummary, "markdown">>;
+  const reviewNotes = normalizeStringArray(parsed.reviewNotes);
+  const topics = normalizeTopics(parsed.topics);
+  const redistributed = redistributeReviewNotes(topics, reviewNotes);
 
   return {
+    objective: normalizeOptionalString(parsed.objective),
+    conclusions: normalizeStringArray(parsed.conclusions),
     nextSteps: normalizeActionItems(parsed.nextSteps),
-    topics: normalizeTopics(parsed.topics),
+    reviewNotes: redistributed.reviewNotes,
+    topics: redistributed.topics,
   };
+}
+
+function buildSummaryJsonCandidates(raw: string): string[] {
+  const candidates = new Set<string>();
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  candidates.add(trimmed.replace(/^```json\s*|\s*```$/g, "").trim());
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const extracted = trimmed.slice(firstBrace, lastBrace + 1).trim();
+    candidates.add(extracted);
+    candidates.add(extracted.replace(/,\s*([}\]])/g, "$1"));
+  }
+
+  return [...candidates].filter(Boolean);
+}
+
+async function repairSummaryJson(
+  raw: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const repairPrompt = [
+    "Return strict JSON only.",
+    `Use this JSON shape: ${SUMMARY_JSON_SHAPE}.`,
+    "Repair the malformed JSON below without changing its meaning.",
+    "Do not add new facts.",
+    "Do not wrap the JSON in markdown fences.",
+    "",
+    "Malformed JSON:",
+    raw.trim(),
+  ].join("\n");
+
+  return requestSummaryText(repairPrompt, signal);
+}
+
+function normalizeOptionalString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = normalizeSummaryLine(value);
+  return trimmed || null;
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -985,7 +1281,7 @@ function normalizeStringArray(value: unknown): string[] {
   }
   return value
     .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.trim())
+    .map((entry) => normalizeSummaryLine(entry))
     .filter(Boolean);
 }
 
@@ -1000,7 +1296,7 @@ function normalizeTopics(value: unknown): MeetingSummary["topics"] {
         return null;
       }
 
-      const title = typeof entry.title === "string" ? entry.title.trim() : "";
+      const title = typeof entry.title === "string" ? normalizeTopicTitle(entry.title) : "";
       if (!title) {
         return null;
       }
@@ -1015,6 +1311,43 @@ function normalizeTopics(value: unknown): MeetingSummary["topics"] {
     .filter((entry): entry is MeetingSummary["topics"][number] => Boolean(entry));
 }
 
+function redistributeReviewNotes(
+  topics: MeetingSummary["topics"],
+  reviewNotes: string[],
+): Pick<MeetingSummary, "topics" | "reviewNotes"> {
+  const collectedReviewNotes = [...reviewNotes];
+  const filteredTopics: MeetingSummary["topics"] = [];
+
+  for (const topic of topics) {
+    const isReviewTopic = /확인 사항|검토 사항|기타 논의 사항/u.test(topic.title);
+    const topicPoints: string[] = [];
+
+    for (const point of topic.points) {
+      if (isReviewTopic || shouldMovePointToReviewNotes(point)) {
+        collectedReviewNotes.push(point);
+        continue;
+      }
+      topicPoints.push(point);
+    }
+
+    if (topicPoints.length > 0) {
+      filteredTopics.push({
+        ...topic,
+        points: topicPoints,
+      });
+    }
+  }
+
+  return {
+    topics: filteredTopics,
+    reviewNotes: Array.from(new Set(collectedReviewNotes)),
+  };
+}
+
+function shouldMovePointToReviewNotes(point: string): boolean {
+  return /(ASR|노이즈|이름 표기|표기 혼선|혼선|추후 확인|확인 필요|사실 확인|불명확|미확정|담당자.*미정|기한.*미정|공식 문서화|별도 확인)/iu.test(point);
+}
+
 function normalizeActionItems(value: unknown): MeetingSummary["nextSteps"] {
   if (!Array.isArray(value)) {
     return [];
@@ -1026,7 +1359,7 @@ function normalizeActionItems(value: unknown): MeetingSummary["nextSteps"] {
         return null;
       }
 
-      const content = typeof entry.content === "string" ? entry.content.trim() : "";
+      const content = typeof entry.content === "string" ? normalizeSummaryLine(entry.content) : "";
       if (!content) {
         return null;
       }
@@ -1042,25 +1375,109 @@ function normalizeActionItems(value: unknown): MeetingSummary["nextSteps"] {
 
 function buildMarkdown(summary: Omit<MeetingSummary, "markdown">): string {
   const sections: string[] = [];
+  const reviewNotesSectionNumber = summary.nextSteps.length > 0 ? 5 : 4;
+
+  sections.push("1. 회의 목적");
+  sections.push(summary.objective ?? "회의 목적이 명확히 언급되지 않았습니다.");
+  sections.push("");
+  sections.push("2. 주요 논의 사항");
+
+  if (summary.topics.length > 0) {
+    for (const [index, topic] of summary.topics.entries()) {
+      sections.push(`2-${index + 1}. ${topic.title}`);
+      for (const point of topic.points) {
+        sections.push(`● ${point}`);
+      }
+      sections.push("");
+    }
+
+    if (sections[sections.length - 1] === "") {
+      sections.pop();
+    }
+  } else {
+    sections.push("● 주요 논의 사항이 명확히 정리되지 않았습니다.");
+  }
+
+  sections.push("");
+  sections.push("3. 회의 결론");
+  if (summary.conclusions.length > 0) {
+    for (const [index, conclusion] of summary.conclusions.entries()) {
+      sections.push(`${index + 1}. ${conclusion}`);
+    }
+  } else if (summary.nextSteps.length > 0) {
+    for (const [index, item] of summary.nextSteps.entries()) {
+      sections.push(`${index + 1}. ${formatActionItemLine(item)}`);
+    }
+  } else {
+    sections.push("1. 회의 결론이 명확히 언급되지 않았습니다.");
+  }
 
   if (summary.nextSteps.length > 0) {
-    const items = summary.nextSteps
-      .map((item) => {
-        let line = `- [ ] ${item.content}`;
-        if (item.assignee) line += ` / 담당: ${item.assignee}`;
-        if (item.dueDate) line += ` / 기한: ${item.dueDate}`;
-        return line;
-      })
-      .join("\n");
-    sections.push(`### 주요 결정 사항 및 다음 단계\n\n${items}`);
+    sections.push("");
+    sections.push("4. 후속 조치");
+    for (const [index, item] of summary.nextSteps.entries()) {
+      sections.push(`${index + 1}. ${formatActionItemLine(item)}`);
+    }
   }
 
-  for (const topic of summary.topics) {
-    const points = topic.points.map((p) => `- ${p}`).join("\n");
-    sections.push(`### ${topic.title}\n\n${points}`);
+  if (summary.reviewNotes.length > 0) {
+    sections.push("");
+    sections.push(`${reviewNotesSectionNumber}. 요약 확인 사항`);
+    for (const note of summary.reviewNotes) {
+      sections.push(`● ${note}`);
+    }
   }
 
-  return sections.join("\n\n");
+  return sections.join("\n");
+}
+
+function formatActionItemLine(item: MeetingSummary["nextSteps"][number]): string {
+  const suffix: string[] = [];
+  if (item.assignee) {
+    suffix.push(`담당: ${item.assignee}`);
+  }
+  if (item.dueDate) {
+    suffix.push(`기한: ${item.dueDate}`);
+  }
+
+  return `${item.content}${suffix.length > 0 ? ` (${suffix.join(", ")})` : ""}`;
+}
+
+function normalizeTopicTitle(value: string): string {
+  let normalized = value.trim();
+
+  while (true) {
+    const next = normalized
+      .replace(/^(?:\d+(?:-\d+)+\.?\s*)+/u, "")
+      .replace(/^(?:\d+[.)]\s*)+/u, "")
+      .trim();
+    if (next === normalized) {
+      break;
+    }
+    normalized = next;
+  }
+
+  return normalized;
+}
+
+function normalizeSummaryLine(value: string): string {
+  let normalized = value.trim();
+
+  while (true) {
+    const next = normalized
+      .replace(/^(?:[●•○▪■☐☑✓*-]+\s*)+/u, "")
+      .replace(/^(?:\d+(?:-\d+)+\.?\s*)+/u, "")
+      .replace(/^(?:\d+[.)]\s*)+/u, "")
+      .trim();
+
+    if (next === normalized) {
+      break;
+    }
+
+    normalized = next;
+  }
+
+  return normalized;
 }
 
 function getMimeType(fileName: string): string {
@@ -1090,6 +1507,21 @@ function getTranscribeConcurrency(): number {
 
 function getSummaryChunkConcurrency(): number {
   return getPositiveIntegerEnv("BREVOCA_SUMMARY_CHUNK_CONCURRENCY", DEFAULT_TRANSCRIBE_CONCURRENCY);
+}
+
+function appendGlossaryInstructions(promptTemplate: string, glossaryPrompt: string): string {
+  if (!glossaryPrompt) {
+    return promptTemplate;
+  }
+
+  return `${promptTemplate.trim()}\n\n용어 사전:\n${glossaryPrompt}`;
+}
+
+function getSummaryTimeoutMs(): number {
+  return getPositiveIntegerEnv(
+    "BREVOCA_SUMMARY_TIMEOUT_MS",
+    DEFAULT_SUMMARY_TIMEOUT_MS,
+  );
 }
 
 function getPositiveIntegerEnv(name: string, fallback: number): number {
@@ -1226,6 +1658,45 @@ function isAbortError(error: unknown): boolean {
   }
 
   return error.name === "AbortError" || error.message.toLowerCase().includes("aborted");
+}
+
+function createTimeoutSignal(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number,
+  timeoutMessage: string,
+): AbortSignal {
+  const controller = new AbortController();
+  let timeoutId: NodeJS.Timeout | null = setTimeout(() => {
+    cleanup();
+    controller.abort(new Error(timeoutMessage));
+  }, timeoutMs);
+
+  const handleParentAbort = () => {
+    cleanup();
+    controller.abort(
+      parentSignal?.reason instanceof Error
+        ? parentSignal.reason
+        : new Error("Request aborted"),
+    );
+  };
+
+  const cleanup = () => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    parentSignal?.removeEventListener("abort", handleParentAbort);
+  };
+
+  if (parentSignal?.aborted) {
+    handleParentAbort();
+    return controller.signal;
+  }
+
+  parentSignal?.addEventListener("abort", handleParentAbort, { once: true });
+  controller.signal.addEventListener("abort", cleanup, { once: true });
+
+  return controller.signal;
 }
 
 function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {

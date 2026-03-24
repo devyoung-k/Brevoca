@@ -9,7 +9,11 @@ import {
   promptTemplateIds,
   type PromptTemplateId,
 } from "@brevoca/contracts";
-import { authedFetch } from "@/lib/client/authed-fetch";
+import { uploadMeetingAudio } from "@/lib/client/meeting-upload";
+import {
+  MAX_AUDIO_UPLOAD_FILE_BYTES,
+  getAudioUploadTooLargeMessage,
+} from "@/lib/uploads";
 import { toast } from "sonner";
 
 export default function UploadPage() {
@@ -60,33 +64,19 @@ export default function UploadPage() {
     setUploading(true);
     setUploadProgress(10);
 
-    const progressTimer = window.setInterval(() => {
-      setUploadProgress((current) => Math.min(current + 12, 90));
-    }, 250);
-
     try {
-      const formData = new FormData();
-      formData.append("file", selectedFile);
-      formData.append("title", resolvedTitle || selectedFile.name);
-      formData.append("language", language);
-      formData.append("promptTemplateId", promptTemplateId);
-      formData.append("sourceType", "upload");
-      formData.append("tags", JSON.stringify(tags));
-      if (durationSec) {
-        formData.append("durationSec", String(durationSec));
-      }
-
-      const response = await authedFetch("/api/meetings", {
-        method: "POST",
-        body: formData,
+      const payload = await uploadMeetingAudio({
+        file: selectedFile,
+        title: resolvedTitle || selectedFile.name,
+        language,
+        promptTemplateId,
+        sourceType: "upload",
+        tags,
+        durationSec,
+        onProgress: (progress) => {
+          setUploadProgress(progress);
+        },
       });
-
-      if (!response.ok) {
-        const errorMessage = await extractServerError(response);
-        throw new Error(errorMessage);
-      }
-
-      const payload = (await response.json()) as { jobId: string };
       setUploadProgress(100);
       toast.success("업로드를 시작했습니다.");
       router.push(`/processing/${payload.jobId}`);
@@ -95,8 +85,6 @@ export default function UploadPage() {
       const message = error instanceof Error ? error.message : "업로드에 실패했습니다.";
       toast.error(message);
       setUploading(false);
-    } finally {
-      window.clearInterval(progressTimer);
     }
   };
 
@@ -123,9 +111,8 @@ export default function UploadPage() {
       return;
     }
 
-    const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
-    if (file.size > MAX_FILE_SIZE) {
-      toast.error("파일 크기가 너무 큽니다. 최대 100MB까지 업로드할 수 있습니다.");
+    if (file.size > MAX_AUDIO_UPLOAD_FILE_BYTES) {
+      toast.error(getAudioUploadTooLargeMessage());
       return;
     }
 
@@ -367,17 +354,4 @@ function formatDuration(durationSec: number | null): string {
 
 function isSupportedAudioFile(file: File): boolean {
   return file.type.startsWith("audio/") || /\.(mp3|wav|m4a|ogg|webm)$/i.test(file.name);
-}
-
-async function extractServerError(response: Response): Promise<string> {
-  try {
-    const payload = (await response.json()) as { error?: string };
-    if (payload.error) {
-      return payload.error;
-    }
-  } catch {
-    // JSON 파싱 실패 시 텍스트로 fallback
-  }
-
-  return `업로드에 실패했습니다. (${response.status})`;
 }

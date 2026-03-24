@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { LayoutDashboard, Upload, Search, Settings, FileText, Plus, Menu, X, Mic } from "lucide-react";
+import { LayoutDashboard, Upload, Search, FileText, Plus, Menu, X, Mic, Building2 } from "lucide-react";
 import { useAppSession } from "@/components/AppSessionProvider";
 import { WorkspaceSwitcher } from "@/components/WorkspaceSwitcher";
 import { GlobalSearch } from "@/components/GlobalSearch";
@@ -37,7 +37,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     { path: "/upload", label: "업로드", icon: Upload, exact: false },
     { path: "/recording", label: "녹음", icon: Mic, exact: false },
     { path: "/search", label: "검색", icon: Search, exact: false },
-    { path: "/settings", label: "설정", icon: Settings, exact: false },
+    { path: "/settings", label: "워크스페이스", icon: Building2, exact: false },
   ];
 
   const isNavActive = (path: string, exact: boolean) => {
