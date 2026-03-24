@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import { Analytics } from "@vercel/analytics/next";
 import { AppSessionProvider } from "@/components/AppSessionProvider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./globals.css";
@@ -18,6 +19,7 @@ export default function RootLayout({
         <AppSessionProvider>
           <TooltipProvider>{children}</TooltipProvider>
         </AppSessionProvider>
+        <Analytics />
       </body>
     </html>
   );
