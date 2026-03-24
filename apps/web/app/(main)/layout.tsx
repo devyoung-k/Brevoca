@@ -16,11 +16,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const { status, workspaces } = useAppSession();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // Close sidebar on route change (mobile)
-  useEffect(() => {
-    setSidebarOpen(false);
-  }, [pathname]);
-
   useEffect(() => {
     if (status === "unauthenticated") {
       router.replace("/login");
@@ -36,7 +31,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     { path: "/dashboard", label: "대시보드", icon: LayoutDashboard, exact: true },
     { path: "/upload", label: "업로드", icon: Upload, exact: false },
     { path: "/recording", label: "녹음", icon: Mic, exact: false },
-    { path: "/search", label: "검색", icon: Search, exact: false },
+    { path: "/meetings", label: "회의 목록", icon: Search, exact: false },
     { path: "/settings", label: "워크스페이스", icon: Building2, exact: false },
   ];
 
@@ -105,6 +100,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               <Link
                 key={item.path}
                 href={item.path}
+                onClick={() => setSidebarOpen(false)}
                 className={`relative flex items-center gap-3 px-4 py-3 rounded-[var(--radius-md)] transition-all duration-200 ${
                   isActive
                     ? "bg-[var(--sidebar-accent)] text-[var(--text-primary)] shadow-[inset_0_0_20px_rgba(0,0,0,0.15)]"
